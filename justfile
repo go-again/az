@@ -41,9 +41,10 @@ bench-save:
 # Compare az against lz4/gzip/zstd/xz on a file or directory
 # Usage: just bench-compare <target>
 #   just bench-compare ./mydir
-#   just bench-compare /usr/share/man
+
+# just bench-compare /usr/share/man
 bench-compare target: build
-    ./scripts/bench.sh -n 5 -w 2 "{{ target }}"
+    ./scripts/bench.sh -n 3 -w 2 "{{ target }}"
 
 # ── Installation ──────────────────────────────────────────────────────────────
 

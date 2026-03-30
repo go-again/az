@@ -1,17 +1,21 @@
-// Package az implements the az compression format.
+// Package az provides a general-purpose compression library and CLI tool.
 //
-// az is a general-purpose compression algorithm that combines LZ77
-// back-reference matching with Huffman and FSE entropy coding.  It provides
-// five compression levels:
-//
-//   - Level1 (Fastest): pure LZ77, no entropy coding — near LZ4 speed
-//   - Level2 (Fast): Huffman-compressed literals, LZ77 sequences
-//   - Level3 (Default): lazy match + Huffman literals + FSE sequences
-//   - Level4 (Better): deeper search, 4X Huffman
-//   - Level5 (Best): optimal parse
-//
+// Levels 1–2 use the LZ4 algorithm; levels 3–5 use Zstandard.
 // The streaming Writer and Reader implement io.WriteCloser / io.ReadCloser
 // and are suitable for use with archive/tar or as a drop-in for gzip.
+//
+//	// One-shot
+//	compressed, err := az.Compress(data, az.Level3)
+//	original, err := az.Decompress(compressed)
+//
+//	// Streaming
+//	w := az.NewWriter(dst, az.WithLevel(az.Level4))
+//	w.Write(data)
+//	w.Close()
+//
+//	r := az.NewReader(src)
+//	io.Copy(dst, r)
+//	r.Close()
 package az
 
 import (
@@ -21,8 +25,31 @@ import (
 	"fmt"
 	"io"
 	"runtime"
-	"sync"
+
+	lz4pkg "github.com/go-again/az/internal/lz4"
+	zstdpkg "github.com/go-again/az/internal/zstd"
 )
+
+// Magic numbers identifying the underlying stream format.
+const (
+	magicLZ4  uint32 = 0x184D2204
+	magicZstd uint32 = 0xFD2FB528
+)
+
+// lz4Level maps az levels to lz4 CompressionLevel constants.
+// Fast (0) uses the hash-only compressor; Level3 (1<<10 = depth 1024) uses HC.
+var lz4Level = map[Level]lz4pkg.CompressionLevel{
+	Level1: lz4pkg.Fast,   // hash-only, no chain — true lz4 speed
+	Level2: lz4pkg.Level3, // HC depth 1024 — moderate compression
+}
+
+
+// zstdLevel maps az levels to zstd EncoderLevel constants.
+var zstdLevel = map[Level]zstdpkg.EncoderLevel{
+	Level3: zstdpkg.SpeedDefault,
+	Level4: zstdpkg.SpeedBetterCompression,
+	Level5: zstdpkg.SpeedBestCompression,
+}
 
 // ─── One-shot helpers ─────────────────────────────────────────────────────────
 
@@ -31,17 +58,39 @@ func Compress(src []byte, level Level) ([]byte, error) {
 	if level < minLevel || level > maxLevel {
 		return nil, ErrLevel
 	}
-	opts := defaultOptions()
-	opts.Level = level
-	opts.ContentSize = true
-
 	var buf bytes.Buffer
-	w := newWriter(&buf, opts)
-	if _, err := w.Write(src); err != nil {
-		return nil, err
-	}
-	if err := w.Close(); err != nil {
-		return nil, err
+	buf.Grow(len(src)/2 + 256)
+
+	if level <= Level2 {
+		w := lz4pkg.NewWriter(&buf)
+		if err := w.Apply(
+			lz4pkg.CompressionLevelOption(lz4Level[level]),
+			lz4pkg.ChecksumOption(true),
+			lz4pkg.SizeOption(uint64(len(src))),
+			lz4pkg.ConcurrencyOption(runtime.GOMAXPROCS(0)),
+		); err != nil {
+			return nil, err
+		}
+		if _, err := w.Write(src); err != nil {
+			return nil, err
+		}
+		if err := w.Close(); err != nil {
+			return nil, err
+		}
+	} else {
+		enc, err := zstdpkg.NewWriter(&buf,
+			zstdpkg.WithEncoderLevel(zstdLevel[level]),
+			zstdpkg.WithEncoderCRC(true),
+		)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := enc.Write(src); err != nil {
+			return nil, err
+		}
+		if err := enc.Close(); err != nil {
+			return nil, err
+		}
 	}
 	return buf.Bytes(), nil
 }
@@ -53,398 +102,120 @@ func Decompress(src []byte) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
-// ─── Parallel block compression ───────────────────────────────────────────────
-
-// parallelJob is a block sent to a compression worker.
-type parallelJob struct {
-	idx      int
-	data     []byte // owned by the job; worker must not retain after sending result
-	isLast   bool
-	cksumVal uint32 // xxh64 sum32 of data (pre-computed by producer)
-}
-
-// parallelResult is a compressed block returned from a worker.
-type parallelResult struct {
-	idx      int
-	hdrWord  uint32 // block header word (size | flags)
-	payload  []byte // compressed bytes
-	cksumVal uint32 // per-block checksum value (over uncompressed data)
-	isLast   bool
-}
-
-// numWorkers returns the number of parallel compression workers to use.
-// We limit to 8 to avoid excessive memory usage (each L5 worker holds ~160 MB).
-func numWorkers() int {
-	n := runtime.GOMAXPROCS(0)
-	if n > 8 {
-		n = 8
-	}
-	return n
-}
-
 // ─── Writer ───────────────────────────────────────────────────────────────────
 
 // Writer compresses data written to it and forwards compressed bytes to the
 // underlying writer.  Call Close to flush and write the end-of-stream marker.
-// Compression is performed in parallel across blocks.
 type Writer struct {
-	w       *bufio.Writer
 	opts    Options
-	cfg     levelConfig
-	buf     []byte // accumulation buffer for the current incomplete block
-	cksum   *xxhDigest
-	written int64
-	closed  bool
-
-	// parallel state (non-nil when workers > 1)
-	jobs       chan parallelJob
-	results    chan parallelResult
-	serialDone chan struct{}
-	serialErr  error
-	blockIdx   int // next block index to dispatch
+	lz4w    *lz4pkg.Writer
+	zstdEnc *zstdpkg.Encoder
 }
 
-// NewWriter returns a new Writer that writes compressed data to w.
-func NewWriter(w io.Writer, opts ...Option) *Writer {
+// NewWriter returns a new Writer that writes compressed data to dst.
+func NewWriter(dst io.Writer, opts ...Option) *Writer {
 	o := defaultOptions()
 	for _, fn := range opts {
 		fn(&o)
 	}
-	return newWriter(w, o)
+	return newWriter(dst, o)
 }
 
-func newWriter(w io.Writer, opts Options) *Writer {
-	cfg := levelConfigs[opts.Level]
-	wr := &Writer{
-		w:     bufio.NewWriterSize(w, 64<<10),
-		opts:  opts,
-		cfg:   cfg,
-		buf:   make([]byte, 0, cfg.blockSize),
-		cksum: newXXH64(),
-	}
-
-	workers := numWorkers()
-	if workers > 1 {
-		// Buffer up to workers+1 jobs so the producer rarely blocks.
-		wr.jobs = make(chan parallelJob, workers+1)
-		wr.results = make(chan parallelResult, workers+1)
-		wr.serialDone = make(chan struct{})
-
-		// Start compression workers.
-		var wg sync.WaitGroup
-		for i := 0; i < workers; i++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				for job := range wr.jobs {
-					st := getEncoderState(opts.Level)
-					compressed, isRaw := compressBlock(job.data, opts.Level, st)
-					putEncoderState(opts.Level, st)
-
-					hdrWord := uint32(len(compressed))
-					if isRaw {
-						hdrWord |= blkIsRaw
-					}
-					if job.isLast {
-						hdrWord |= blkIsLast
-					}
-					wr.results <- parallelResult{
-						idx:      job.idx,
-						hdrWord:  hdrWord,
-						payload:  compressed,
-						cksumVal: job.cksumVal,
-						isLast:   job.isLast,
-					}
-				}
-			}()
+func newWriter(dst io.Writer, opts Options) *Writer {
+	w := &Writer{opts: opts}
+	if opts.Level <= Level2 {
+		w.lz4w = lz4pkg.NewWriter(dst)
+		_ = w.lz4w.Apply(
+			lz4pkg.CompressionLevelOption(lz4Level[opts.Level]),
+			lz4pkg.ChecksumOption(opts.Checksum),
+			lz4pkg.BlockChecksumOption(opts.Checksum),
+			lz4pkg.ConcurrencyOption(runtime.GOMAXPROCS(0)),
+		)
+	} else {
+		enc, err := zstdpkg.NewWriter(dst,
+			zstdpkg.WithEncoderLevel(zstdLevel[opts.Level]),
+			zstdpkg.WithEncoderCRC(opts.Checksum),
+		)
+		if err != nil {
+			// NewWriter only fails on invalid options; our options are always valid.
+			panic(fmt.Sprintf("az: zstd.NewWriter: %v", err))
 		}
-
-		// Close results when all workers finish.
-		go func() {
-			wg.Wait()
-			close(wr.results)
-		}()
-
-		// Start serializer: collects results and writes them in order.
-		go wr.serialize()
+		w.zstdEnc = enc
 	}
-
-	return wr
-}
-
-// serialize drains wr.results in block-index order and writes to wr.w.
-// Runs as a goroutine; signals wr.serialDone when finished.
-func (w *Writer) serialize() {
-	defer close(w.serialDone)
-
-	pending := make(map[int]parallelResult)
-	nextWrite := 0
-
-	writePending := func() {
-		for {
-			r, ok := pending[nextWrite]
-			if !ok {
-				break
-			}
-			delete(pending, nextWrite)
-			nextWrite++
-
-			if w.serialErr != nil {
-				continue // drain without writing
-			}
-			// Update content checksum in order.
-			if w.opts.Checksum {
-				// cksumVal is sum32 of uncompressed block data — feed raw bytes
-				// to w.cksum by re-hashing is not possible here without the data.
-				// Instead, the producer wrote to w.cksum before dispatching.
-				// Nothing to do here; done in dispatchBlock.
-				_ = r.cksumVal
-			}
-
-			var hdr [4]byte
-			binary.LittleEndian.PutUint32(hdr[:], r.hdrWord)
-			if _, err := w.w.Write(hdr[:]); err != nil {
-				w.serialErr = err
-				continue
-			}
-			if _, err := w.w.Write(r.payload); err != nil {
-				w.serialErr = err
-				continue
-			}
-			if w.opts.Checksum && len(r.payload) > 0 {
-				var cs [4]byte
-				binary.LittleEndian.PutUint32(cs[:], r.cksumVal)
-				if _, err := w.w.Write(cs[:]); err != nil {
-					w.serialErr = err
-				}
-			}
-		}
-	}
-
-	for r := range w.results {
-		pending[r.idx] = r
-		writePending()
-	}
-	// Flush after all blocks written.
-	if w.serialErr == nil {
-		w.serialErr = w.w.Flush()
-	}
+	return w
 }
 
 // Write compresses p and writes it to the underlying writer.
 func (w *Writer) Write(p []byte) (int, error) {
-	if w.closed {
-		return 0, fmt.Errorf("az: write to closed writer")
+	if w.lz4w != nil {
+		return w.lz4w.Write(p)
 	}
-	if len(p) == 0 {
-		return 0, nil
-	}
-
-	// Write frame header on first non-empty Write.
-	if w.written == 0 && len(w.buf) == 0 {
-		if err := writeFrameHeader(w.w, w.opts, -1); err != nil {
-			return 0, err
-		}
-		if w.jobs != nil {
-			// Flush the frame header before parallel blocks arrive.
-			if err := w.w.Flush(); err != nil {
-				return 0, err
-			}
-		}
-	}
-
-	total := len(p)
-	for len(p) > 0 {
-		space := w.cfg.blockSize - len(w.buf)
-		n := len(p)
-		if n > space {
-			n = space
-		}
-		w.buf = append(w.buf, p[:n]...)
-		p = p[n:]
-		w.written += int64(n)
-
-		if len(w.buf) >= w.cfg.blockSize {
-			if err := w.dispatchBlock(false); err != nil {
-				return total - len(p), err
-			}
-		}
-	}
-	return total, nil
+	return w.zstdEnc.Write(p)
 }
 
-// dispatchBlock dispatches w.buf as a block to be compressed (parallel) or
-// compresses it directly (sequential fallback).
-func (w *Writer) dispatchBlock(isLast bool) error {
-	if len(w.buf) == 0 && !isLast {
-		return nil
-	}
-
-	if w.jobs == nil {
-		// Sequential path.
-		return w.flushBlockSeq(isLast)
-	}
-
-	// Parallel path: checksum the uncompressed data in order here (producer side).
-	var cksumVal uint32
-	if w.opts.Checksum && len(w.buf) > 0 {
-		_, _ = w.cksum.Write(w.buf)
-		d := newXXH64()
-		_, _ = d.Write(w.buf)
-		cksumVal = d.Sum32()
-	}
-
-	// Copy the block data; the worker owns it.
-	data := make([]byte, len(w.buf))
-	copy(data, w.buf)
-
-	w.jobs <- parallelJob{
-		idx:      w.blockIdx,
-		data:     data,
-		isLast:   isLast,
-		cksumVal: cksumVal,
-	}
-	w.blockIdx++
-	w.buf = w.buf[:0]
-	return nil
-}
-
-// flushBlockSeq is the original sequential block flush (used when workers==1).
-func (w *Writer) flushBlockSeq(isLast bool) error {
-	if len(w.buf) == 0 && !isLast {
-		return nil
-	}
-
-	// Update content checksum before compression
-	if w.opts.Checksum && len(w.buf) > 0 {
-		_, _ = w.cksum.Write(w.buf)
-	}
-
-	st := getEncoderState(w.opts.Level)
-	compressed, isRaw := compressBlock(w.buf, w.opts.Level, st)
-	putEncoderState(w.opts.Level, st)
-
-	// Block header
-	var hdr [4]byte
-	h := uint32(len(compressed))
-	if isRaw {
-		h |= blkIsRaw
-	}
-	if isLast {
-		h |= blkIsLast
-	}
-	binary.LittleEndian.PutUint32(hdr[:], h)
-	if _, err := w.w.Write(hdr[:]); err != nil {
-		return err
-	}
-	if _, err := w.w.Write(compressed); err != nil {
-		return err
-	}
-
-	// Block checksum
-	if w.opts.Checksum && len(w.buf) > 0 {
-		d := newXXH64()
-		_, _ = d.Write(w.buf)
-		var cs [4]byte
-		binary.LittleEndian.PutUint32(cs[:], d.Sum32())
-		if _, err := w.w.Write(cs[:]); err != nil {
-			return err
-		}
-	}
-
-	w.buf = w.buf[:0]
-	return nil
-}
-
-// Close flushes any buffered data and writes the end-of-stream marker.
+// Close flushes any buffered data and finalises the stream.
 func (w *Writer) Close() error {
-	if w.closed {
-		return nil
+	if w.lz4w != nil {
+		return w.lz4w.Close()
 	}
-	w.closed = true
-
-	// If nothing was written yet, emit a minimal empty frame.
-	if w.written == 0 && len(w.buf) == 0 {
-		opts := w.opts
-		opts.ContentSize = true // advertise size=0
-		if err := writeFrameHeader(w.w, opts, 0); err != nil {
-			return err
-		}
-		if w.jobs != nil {
-			close(w.jobs)
-			<-w.serialDone
-			if w.serialErr != nil {
-				return w.serialErr
-			}
-		}
-		if err := writeEndOfStream(w.w, w.cksum.Sum32(), w.opts.Checksum); err != nil {
-			return err
-		}
-		return w.w.Flush()
-	}
-
-	if err := w.dispatchBlock(false); err != nil {
-		return err
-	}
-
-	if w.jobs != nil {
-		close(w.jobs)
-		<-w.serialDone
-		if w.serialErr != nil {
-			return w.serialErr
-		}
-		if err := writeEndOfStream(w.w, w.cksum.Sum32(), w.opts.Checksum); err != nil {
-			return err
-		}
-		return w.w.Flush()
-	}
-
-	if err := writeEndOfStream(w.w, w.cksum.Sum32(), w.opts.Checksum); err != nil {
-		return err
-	}
-	return w.w.Flush()
+	return w.zstdEnc.Close()
 }
 
-// Reset discards the writer's state and starts writing a new stream to dst.
+// Reset discards the writer's state and starts a new stream writing to dst.
 func (w *Writer) Reset(dst io.Writer) {
-	// If parallel workers are running, stop them first.
-	if w.jobs != nil && !w.closed {
-		close(w.jobs)
-		<-w.serialDone
+	if w.lz4w != nil {
+		w.lz4w.Reset(dst)
+		return
 	}
-	w.w.Reset(dst)
-	w.buf = w.buf[:0]
-	w.written = 0
-	w.closed = false
-	w.cksum.reset()
-	w.blockIdx = 0
-	w.serialErr = nil
-
-	if w.jobs != nil {
-		// Restart workers.
-		*w = *newWriter(dst, w.opts)
-	}
+	w.zstdEnc.Reset(dst)
 }
 
 // ─── Reader ───────────────────────────────────────────────────────────────────
 
-// Reader decompresses data read from an underlying reader.
+// Reader decompresses data from an underlying reader.
+// It auto-detects whether the stream uses the LZ4 or Zstandard format.
 type Reader struct {
-	r        *bufio.Reader
-	fh       frameHeader
-	buf      []byte // decompressed but not yet consumed
-	cksum    *xxhDigest
-	headerOK bool
-	done     bool
-	err      error
+	br          *bufio.Reader
+	src         io.Reader
+	lz4r        *lz4pkg.Reader
+	zstdDec     *zstdpkg.Decoder
+	initialized bool
+	err         error
 }
 
-// NewReader returns a new Reader that decompresses from r.
-func NewReader(r io.Reader) *Reader {
+// NewReader returns a new Reader that decompresses from src.
+func NewReader(src io.Reader) *Reader {
 	return &Reader{
-		r:     bufio.NewReaderSize(r, 64<<10),
-		cksum: newXXH64(),
+		br:  bufio.NewReaderSize(src, 64<<10),
+		src: src,
 	}
+}
+
+// init detects the stream format from the first four magic bytes and creates
+// the appropriate sub-reader without consuming bytes (bufio.Peek).
+func (r *Reader) init() error {
+	magic, err := r.br.Peek(4)
+	if err != nil {
+		if err == io.EOF {
+			return io.EOF
+		}
+		return ErrCorrupted
+	}
+	m := binary.LittleEndian.Uint32(magic)
+	switch m {
+	case magicLZ4:
+		r.lz4r = lz4pkg.NewReader(r.br)
+	case magicZstd:
+		dec, err := zstdpkg.NewReader(r.br)
+		if err != nil {
+			return fmt.Errorf("az: %w", ErrCorrupted)
+		}
+		r.zstdDec = dec
+	default:
+		return ErrCorrupted
+	}
+	r.initialized = true
+	return nil
 }
 
 // Read reads decompressed data into p.
@@ -452,125 +223,38 @@ func (r *Reader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
-	if r.done {
-		return 0, io.EOF
-	}
-
-	// Parse frame header on first read
-	if !r.headerOK {
-		fh, err := readFrameHeader(r.r)
-		if err != nil {
+	if !r.initialized {
+		if err := r.init(); err != nil {
 			r.err = err
 			return 0, err
 		}
-		r.fh = fh
-		r.headerOK = true
 	}
-
-	// Drain existing buffer
-	if len(r.buf) > 0 {
-		n := copy(p, r.buf)
-		r.buf = r.buf[n:]
-		return n, nil
+	if r.lz4r != nil {
+		return r.lz4r.Read(p)
 	}
-
-	// Read next block
-	for {
-		bh, err := readBlockHeader(r.r)
-		if err != nil {
-			r.err = err
-			return 0, err
-		}
-
-		if bh.isLast && bh.size == 0 {
-			// End of stream
-			if r.fh.checksum {
-				var cs [4]byte
-				if _, err2 := io.ReadFull(r.r, cs[:]); err2 != nil {
-					r.err = ErrCorrupted
-					return 0, r.err
-				}
-				stored := binary.LittleEndian.Uint32(cs[:])
-				if stored != r.cksum.Sum32() {
-					r.err = ErrChecksumFail
-					return 0, r.err
-				}
-			}
-			r.done = true
-			return 0, io.EOF
-		}
-
-		// Read block data
-		blockData := make([]byte, bh.size)
-		if _, err := io.ReadFull(r.r, blockData); err != nil {
-			r.err = ErrCorrupted
-			return 0, r.err
-		}
-
-		// Read block checksum if present
-		if r.fh.checksum {
-			var cs [4]byte
-			if _, err2 := io.ReadFull(r.r, cs[:]); err2 != nil {
-				r.err = ErrCorrupted
-				return 0, r.err
-			}
-			// checksum is over the uncompressed data — verified after decompression
-		}
-
-		// Decompress
-		out, err := decompressBlockData(blockData, bh.isRaw, r.fh.blockSize)
-		if err != nil {
-			r.err = err
-			return 0, err
-		}
-
-		// Update content checksum
-		if r.fh.checksum {
-			_, _ = r.cksum.Write(out)
-		}
-
-		r.buf = out
-		n := copy(p, r.buf)
-		r.buf = r.buf[n:]
-		return n, nil
-	}
+	return r.zstdDec.Read(p)
 }
 
-// Close closes the reader and discards any unread data.
+// Close closes the reader.
 func (r *Reader) Close() error {
-	r.done = true
+	if r.zstdDec != nil {
+		r.zstdDec.Close()
+	}
 	return nil
 }
 
-// Reset discards the reader's state and starts reading from src.
+// Reset discards the reader's state and starts reading a new stream from src.
 func (r *Reader) Reset(src io.Reader) {
-	r.r.Reset(src)
-	r.buf = nil
-	r.done = false
+	r.src = src
+	r.br.Reset(src)
+	r.initialized = false
 	r.err = nil
-	r.headerOK = false
-	r.cksum.reset()
-}
-
-// ─── Pool for reusing encoderState ───────────────────────────────────────────
-
-var encoderPools [6]sync.Pool
-
-func init() {
-	for i := Level1; i <= Level5; i++ {
-		level := i
-		encoderPools[level].New = func() any {
-			return newEncoderState(levelConfigs[level])
-		}
+	if r.lz4r != nil {
+		r.lz4r.Reset(r.br)
+		r.lz4r = nil
 	}
-}
-
-func getEncoderState(level Level) *encoderState {
-	st := encoderPools[level].Get().(*encoderState)
-	st.resetFull(levelConfigs[level])
-	return st
-}
-
-func putEncoderState(level Level, st *encoderState) {
-	encoderPools[level].Put(st)
+	if r.zstdDec != nil {
+		r.zstdDec.Reset(r.br) //nolint // Reset returns error only on option changes
+		r.zstdDec = nil
+	}
 }

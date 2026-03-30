@@ -4,11 +4,11 @@ package az
 type Level int
 
 const (
-	Level1       Level = 1 // Fastest — pure LZ77, no entropy coding
-	Level2       Level = 2 // Fast — dual hash + Huffman literals
-	Level3       Level = 3 // Default — lazy match + Huffman + FSE sequences
-	Level4       Level = 4 // Better — deeper search + 4X Huffman
-	Level5       Level = 5 // Best — optimal parse
+	Level1       Level = 1 // Fastest — lz4 level 3
+	Level2       Level = 2 // Fast    — lz4 level 6
+	Level3       Level = 3 // Default — zstd level 6
+	Level4       Level = 4 // Better  — zstd level 12
+	Level5       Level = 5 // Best    — zstd level 18
 	DefaultLevel       = Level3
 
 	minLevel = Level1
@@ -18,8 +18,8 @@ const (
 // Options controls compression behaviour.
 type Options struct {
 	Level       Level
-	Checksum    bool // include per-block and content checksums (default true)
-	ContentSize bool // store uncompressed content size in frame header
+	Checksum    bool // include checksums (default true)
+	ContentSize bool // store uncompressed content size in frame header (one-shot only)
 }
 
 // defaultOptions returns sensible defaults.
@@ -44,6 +44,7 @@ func WithChecksum(on bool) Option {
 }
 
 // WithContentSize enables storing the uncompressed size in the frame header.
+// This is honoured only when using the one-shot Compress helper.
 func WithContentSize(on bool) Option {
 	return func(o *Options) { o.ContentSize = on }
 }
