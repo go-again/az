@@ -33,56 +33,56 @@ type levelConfig struct {
 var levelConfigs = [6]levelConfig{
 	{}, // index 0 unused
 	{
-		blockSize:  64 << 10,
-		windowSize: 64 << 10,
-		shortBits:  16,
-		longBits:   0,
+		blockSize:  8 << 20, // 8MB: 7 blocks on 51MB → all process in 1 parallel round
+		windowSize: 8 << 20,
+		shortBits:  20, // 1M entries; 8:1 collision for 8MB block — fast, single hash
+		longBits:   0,  // no long hash: simplest possible match finding
 		lazyDepth:  0,
 		chainDepth: 0,
-		litMode:    entropyNone,
+		litMode:    entropyNone, // raw literals: no Huffman overhead, simpler/faster
 		seqMode:    entropyNone,
-		bsID:       bsID64K,
+		bsID:       bsID8M,
 	},
 	{
-		blockSize:  256 << 10,
-		windowSize: 256 << 10,
-		shortBits:  16,
-		longBits:   18,
+		blockSize:  8 << 20, // 8MB: same window as L1; dual hash + Huffman beats L1's ratio
+		windowSize: 8 << 20,
+		shortBits:  20, // 1M entries; 8:1 collision for 8MB block — greedy so still fast
+		longBits:   18, // 256K entries for 8-byte hash; finds longer matches than L1
 		lazyDepth:  0,
 		chainDepth: 0,
-		litMode:    entropyStaticHuff,
-		seqMode:    entropyNone,
-		bsID:       bsID256K,
-	},
-	{
-		blockSize:  1 << 20,
-		windowSize: 1 << 20,
-		shortBits:  16,
-		longBits:   20,
-		lazyDepth:  1,
-		chainDepth: 0,
-		litMode:    entropyAdaptHuff,
+		litMode:    entropyAdaptHuff, // Compress4X for large litBufs (8MB blocks)
 		seqMode:    entropyFSE,
-		bsID:       bsID1M,
+		bsID:       bsID8M,
 	},
 	{
-		blockSize:  4 << 20,
-		windowSize: 4 << 20,
-		shortBits:  17,
-		longBits:   22,
+		blockSize:  8 << 20, // 8MB block = widest practical matching scope
+		windowSize: 8 << 20,
+		shortBits:  19, // 512K entries; 16:1 collision for 8MB block
+		longBits:   21,
 		lazyDepth:  2,
-		chainDepth: 4,
+		chainDepth: 8,
 		litMode:    entropyAdaptHuff,
 		seqMode:    entropyFSE,
-		bsID:       bsID4M,
+		bsID:       bsID8M,
 	},
 	{
 		blockSize:  8 << 20,
 		windowSize: 8 << 20,
-		shortBits:  17,
-		longBits:   23,
+		shortBits:  19, // 512K entries; deeper search than L3
+		longBits:   22,
+		lazyDepth:  4,
+		chainDepth: 32,
+		litMode:    entropyAdaptHuff,
+		seqMode:    entropyFSE,
+		bsID:       bsID8M,
+	},
+	{
+		blockSize:  8 << 20,
+		windowSize: 8 << 20,
+		shortBits:  20, // 1M entries for optimal parse; chain gives deep search
+		longBits:   22,
 		lazyDepth:  0, // optimal parse (special case)
-		chainDepth: 16,
+		chainDepth: 4, // shallow chain: parallelism × fewer cache misses outweighs deep search
 		litMode:    entropyAdaptHuff,
 		seqMode:    entropyFSE,
 		bsID:       bsID8M,

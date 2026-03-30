@@ -20,6 +20,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"runtime"
 	"sync"
 )
 
@@ -52,19 +53,55 @@ func Decompress(src []byte) ([]byte, error) {
 	return io.ReadAll(r)
 }
 
+// ─── Parallel block compression ───────────────────────────────────────────────
+
+// parallelJob is a block sent to a compression worker.
+type parallelJob struct {
+	idx      int
+	data     []byte // owned by the job; worker must not retain after sending result
+	isLast   bool
+	cksumVal uint32 // xxh64 sum32 of data (pre-computed by producer)
+}
+
+// parallelResult is a compressed block returned from a worker.
+type parallelResult struct {
+	idx      int
+	hdrWord  uint32 // block header word (size | flags)
+	payload  []byte // compressed bytes
+	cksumVal uint32 // per-block checksum value (over uncompressed data)
+	isLast   bool
+}
+
+// numWorkers returns the number of parallel compression workers to use.
+// We limit to 8 to avoid excessive memory usage (each L5 worker holds ~160 MB).
+func numWorkers() int {
+	n := runtime.GOMAXPROCS(0)
+	if n > 8 {
+		n = 8
+	}
+	return n
+}
+
 // ─── Writer ───────────────────────────────────────────────────────────────────
 
 // Writer compresses data written to it and forwards compressed bytes to the
 // underlying writer.  Call Close to flush and write the end-of-stream marker.
+// Compression is performed in parallel across blocks.
 type Writer struct {
 	w       *bufio.Writer
 	opts    Options
 	cfg     levelConfig
-	st      *encoderState
-	buf     []byte // accumulation buffer
+	buf     []byte // accumulation buffer for the current incomplete block
 	cksum   *xxhDigest
 	written int64
 	closed  bool
+
+	// parallel state (non-nil when workers > 1)
+	jobs       chan parallelJob
+	results    chan parallelResult
+	serialDone chan struct{}
+	serialErr  error
+	blockIdx   int // next block index to dispatch
 }
 
 // NewWriter returns a new Writer that writes compressed data to w.
@@ -78,13 +115,119 @@ func NewWriter(w io.Writer, opts ...Option) *Writer {
 
 func newWriter(w io.Writer, opts Options) *Writer {
 	cfg := levelConfigs[opts.Level]
-	return &Writer{
+	wr := &Writer{
 		w:     bufio.NewWriterSize(w, 64<<10),
 		opts:  opts,
 		cfg:   cfg,
-		st:    newEncoderState(cfg),
 		buf:   make([]byte, 0, cfg.blockSize),
 		cksum: newXXH64(),
+	}
+
+	workers := numWorkers()
+	if workers > 1 {
+		// Buffer up to workers+1 jobs so the producer rarely blocks.
+		wr.jobs = make(chan parallelJob, workers+1)
+		wr.results = make(chan parallelResult, workers+1)
+		wr.serialDone = make(chan struct{})
+
+		// Start compression workers.
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for job := range wr.jobs {
+					st := getEncoderState(opts.Level)
+					compressed, isRaw := compressBlock(job.data, opts.Level, st)
+					putEncoderState(opts.Level, st)
+
+					hdrWord := uint32(len(compressed))
+					if isRaw {
+						hdrWord |= blkIsRaw
+					}
+					if job.isLast {
+						hdrWord |= blkIsLast
+					}
+					wr.results <- parallelResult{
+						idx:      job.idx,
+						hdrWord:  hdrWord,
+						payload:  compressed,
+						cksumVal: job.cksumVal,
+						isLast:   job.isLast,
+					}
+				}
+			}()
+		}
+
+		// Close results when all workers finish.
+		go func() {
+			wg.Wait()
+			close(wr.results)
+		}()
+
+		// Start serializer: collects results and writes them in order.
+		go wr.serialize()
+	}
+
+	return wr
+}
+
+// serialize drains wr.results in block-index order and writes to wr.w.
+// Runs as a goroutine; signals wr.serialDone when finished.
+func (w *Writer) serialize() {
+	defer close(w.serialDone)
+
+	pending := make(map[int]parallelResult)
+	nextWrite := 0
+
+	writePending := func() {
+		for {
+			r, ok := pending[nextWrite]
+			if !ok {
+				break
+			}
+			delete(pending, nextWrite)
+			nextWrite++
+
+			if w.serialErr != nil {
+				continue // drain without writing
+			}
+			// Update content checksum in order.
+			if w.opts.Checksum {
+				// cksumVal is sum32 of uncompressed block data — feed raw bytes
+				// to w.cksum by re-hashing is not possible here without the data.
+				// Instead, the producer wrote to w.cksum before dispatching.
+				// Nothing to do here; done in dispatchBlock.
+				_ = r.cksumVal
+			}
+
+			var hdr [4]byte
+			binary.LittleEndian.PutUint32(hdr[:], r.hdrWord)
+			if _, err := w.w.Write(hdr[:]); err != nil {
+				w.serialErr = err
+				continue
+			}
+			if _, err := w.w.Write(r.payload); err != nil {
+				w.serialErr = err
+				continue
+			}
+			if w.opts.Checksum && len(r.payload) > 0 {
+				var cs [4]byte
+				binary.LittleEndian.PutUint32(cs[:], r.cksumVal)
+				if _, err := w.w.Write(cs[:]); err != nil {
+					w.serialErr = err
+				}
+			}
+		}
+	}
+
+	for r := range w.results {
+		pending[r.idx] = r
+		writePending()
+	}
+	// Flush after all blocks written.
+	if w.serialErr == nil {
+		w.serialErr = w.w.Flush()
 	}
 }
 
@@ -102,6 +245,12 @@ func (w *Writer) Write(p []byte) (int, error) {
 		if err := writeFrameHeader(w.w, w.opts, -1); err != nil {
 			return 0, err
 		}
+		if w.jobs != nil {
+			// Flush the frame header before parallel blocks arrive.
+			if err := w.w.Flush(); err != nil {
+				return 0, err
+			}
+		}
 	}
 
 	total := len(p)
@@ -116,7 +265,7 @@ func (w *Writer) Write(p []byte) (int, error) {
 		w.written += int64(n)
 
 		if len(w.buf) >= w.cfg.blockSize {
-			if err := w.flushBlock(false); err != nil {
+			if err := w.dispatchBlock(false); err != nil {
 				return total - len(p), err
 			}
 		}
@@ -124,7 +273,44 @@ func (w *Writer) Write(p []byte) (int, error) {
 	return total, nil
 }
 
-func (w *Writer) flushBlock(isLast bool) error {
+// dispatchBlock dispatches w.buf as a block to be compressed (parallel) or
+// compresses it directly (sequential fallback).
+func (w *Writer) dispatchBlock(isLast bool) error {
+	if len(w.buf) == 0 && !isLast {
+		return nil
+	}
+
+	if w.jobs == nil {
+		// Sequential path.
+		return w.flushBlockSeq(isLast)
+	}
+
+	// Parallel path: checksum the uncompressed data in order here (producer side).
+	var cksumVal uint32
+	if w.opts.Checksum && len(w.buf) > 0 {
+		_, _ = w.cksum.Write(w.buf)
+		d := newXXH64()
+		_, _ = d.Write(w.buf)
+		cksumVal = d.Sum32()
+	}
+
+	// Copy the block data; the worker owns it.
+	data := make([]byte, len(w.buf))
+	copy(data, w.buf)
+
+	w.jobs <- parallelJob{
+		idx:      w.blockIdx,
+		data:     data,
+		isLast:   isLast,
+		cksumVal: cksumVal,
+	}
+	w.blockIdx++
+	w.buf = w.buf[:0]
+	return nil
+}
+
+// flushBlockSeq is the original sequential block flush (used when workers==1).
+func (w *Writer) flushBlockSeq(isLast bool) error {
 	if len(w.buf) == 0 && !isLast {
 		return nil
 	}
@@ -134,7 +320,9 @@ func (w *Writer) flushBlock(isLast bool) error {
 		_, _ = w.cksum.Write(w.buf)
 	}
 
-	compressed, isRaw := compressBlock(w.buf, w.opts.Level, w.st)
+	st := getEncoderState(w.opts.Level)
+	compressed, isRaw := compressBlock(w.buf, w.opts.Level, st)
+	putEncoderState(w.opts.Level, st)
 
 	// Block header
 	var hdr [4]byte
@@ -149,7 +337,6 @@ func (w *Writer) flushBlock(isLast bool) error {
 	if _, err := w.w.Write(hdr[:]); err != nil {
 		return err
 	}
-
 	if _, err := w.w.Write(compressed); err != nil {
 		return err
 	}
@@ -166,7 +353,6 @@ func (w *Writer) flushBlock(isLast bool) error {
 	}
 
 	w.buf = w.buf[:0]
-	w.st.resetBlock()
 	return nil
 }
 
@@ -179,11 +365,17 @@ func (w *Writer) Close() error {
 
 	// If nothing was written yet, emit a minimal empty frame.
 	if w.written == 0 && len(w.buf) == 0 {
-		// For empty streams, write a frame with no data blocks.
 		opts := w.opts
 		opts.ContentSize = true // advertise size=0
 		if err := writeFrameHeader(w.w, opts, 0); err != nil {
 			return err
+		}
+		if w.jobs != nil {
+			close(w.jobs)
+			<-w.serialDone
+			if w.serialErr != nil {
+				return w.serialErr
+			}
 		}
 		if err := writeEndOfStream(w.w, w.cksum.Sum32(), w.opts.Checksum); err != nil {
 			return err
@@ -191,9 +383,22 @@ func (w *Writer) Close() error {
 		return w.w.Flush()
 	}
 
-	if err := w.flushBlock(false); err != nil {
+	if err := w.dispatchBlock(false); err != nil {
 		return err
 	}
+
+	if w.jobs != nil {
+		close(w.jobs)
+		<-w.serialDone
+		if w.serialErr != nil {
+			return w.serialErr
+		}
+		if err := writeEndOfStream(w.w, w.cksum.Sum32(), w.opts.Checksum); err != nil {
+			return err
+		}
+		return w.w.Flush()
+	}
+
 	if err := writeEndOfStream(w.w, w.cksum.Sum32(), w.opts.Checksum); err != nil {
 		return err
 	}
@@ -202,12 +407,23 @@ func (w *Writer) Close() error {
 
 // Reset discards the writer's state and starts writing a new stream to dst.
 func (w *Writer) Reset(dst io.Writer) {
+	// If parallel workers are running, stop them first.
+	if w.jobs != nil && !w.closed {
+		close(w.jobs)
+		<-w.serialDone
+	}
 	w.w.Reset(dst)
 	w.buf = w.buf[:0]
 	w.written = 0
 	w.closed = false
 	w.cksum.reset()
-	w.st.resetFull(w.cfg)
+	w.blockIdx = 0
+	w.serialErr = nil
+
+	if w.jobs != nil {
+		// Restart workers.
+		*w = *newWriter(dst, w.opts)
+	}
 }
 
 // ─── Reader ───────────────────────────────────────────────────────────────────

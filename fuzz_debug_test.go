@@ -30,11 +30,11 @@ func TestFuzzCaseL2(t *testing.T) {
 
 	// Also trace the sequences manually
 	st := newEncoderState(levelConfigs[Level2])
-	result := encodeL2(data, st)
-	fmt.Printf("Block type: 0x%02x, seqs count: %d\n", result[0], len(st.seqs))
-	for i, s := range st.seqs {
-		fmt.Printf("  seq[%d]: litLen=%d matchLen=%d offset=%d repIdx=%d\n", i, s.litLen, s.matchLen, s.offset, s.repIdx)
+	litBuf, seqs := encodeL2(data, st)
+	fmt.Printf("seqs count: %d\n", len(seqs))
+	for i, s := range seqs {
+		fmt.Printf("  seq[%d]: litLen=%d matchLen=%d offset=%d\n", i, s.litLen, s.matchLen, s.offset)
 	}
-	fmt.Printf("litBuf: %q\n", st.litBuf)
+	fmt.Printf("litBuf: %q\n", litBuf)
 	fmt.Printf("data:   %q\n", data)
 }

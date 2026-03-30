@@ -29,6 +29,10 @@ type encoderState struct {
 	// chain tables for levels 4-5
 	chainTable []int32  // chainTable[pos & chainMask] = previous pos with same hash
 	chainMask  int
+	// pre-allocated DP arrays for optimalParse (reused across blocks)
+	dpCost    []int
+	dpFrom    []int32
+	dpFromRef []int32
 }
 
 func newEncoderState(cfg levelConfig) *encoderState {
@@ -48,6 +52,11 @@ func newEncoderState(cfg levelConfig) *encoderState {
 		mask := cfg.windowSize - 1
 		st.chainTable = make([]int32, cfg.windowSize)
 		st.chainMask = mask
+		// Pre-allocate DP arrays for optimalParse (blockSize+1 entries each).
+		sz := cfg.blockSize + 1
+		st.dpCost = make([]int, sz)
+		st.dpFrom = make([]int32, sz)
+		st.dpFromRef = make([]int32, sz)
 	}
 	return st
 }
@@ -92,10 +101,12 @@ func (st *encoderState) naivePushRecent(off uint32) {
 	st.recentOff[0] = off
 }
 
-// ─── Level 1: pure LZ77, single hash, greedy ────────────────────────────────
+// ─── Level 1: single hash, greedy, no entropy coding ────────────────────────
 
-// encodeL1 compresses src using a single hash table, greedy matching.
-// Output is block-type 0x00: separated literals + raw-sequence stream.
+// encodeL1 compresses src using a single hash table, greedy matching, adaptive
+// skip, and raw (no Huffman) literal output. 8MB blocks mean only ~7 goroutine
+// jobs on a 51MB corpus → all process in one parallel round, maximising speed.
+// The differentiator from L2: no entropy coding, single hash, far fewer jobs.
 func encodeL1(src []byte, st *encoderState) []byte {
 	cfg := levelConfigs[Level1]
 	st.ht1.reset()
@@ -119,46 +130,72 @@ func encodeL1(src []byte, st *encoderState) []byte {
 				si--
 				ref--
 			}
-			// Extend forward
 			mLen := minMatch + extendMatch(src, si+minMatch, ref+minMatch, len(src)-5)
-			off := uint32(si - ref)
-
 			seqs = append(seqs, sequence{
 				litLen:   uint32(si - anchor),
 				matchLen: uint32(mLen),
-				offset:   off,
+				offset:   uint32(si - ref),
 			})
 			litBuf = append(litBuf, src[anchor:si]...)
 			si += mLen
 			anchor = si
 		} else {
-			// Adaptive skip for incompressible data
 			si += 1 + (si-anchor)>>adaptSkip
 		}
 	}
 
-	// Tail literals
 	litBuf = append(litBuf, src[anchor:]...)
 	seqs = append(seqs, sequence{litLen: uint32(len(src) - anchor)})
 
 	st.seqs = seqs
 	st.litBuf = litBuf
-	return buildRawSeqBlock(src, seqs, litBuf, nil, false)
+	return buildCompactSeqBlock(seqs, litBuf)
 }
 
-// ─── Level 2: dual hash + 3-recent-offset LRU + Huffman literals ─────────────
+// buildCompactSeqBlock assembles a block-type-0x04 payload.
+// No per-sequence flag byte; 3-byte offset (sufficient for ≤16MB window).
+// Layout: [0x04][litLen:u24][lits][seqCount:u24] then per-seq: [token][overflow...][offset:3]
+// Trailing literals (those in the last sequence with matchLen==0) are encoded implicitly
+// as lits[sum_of_lLen:] — the decoder emits them after processing seqCount sequences.
+func buildCompactSeqBlock(seqs []sequence, litBuf []byte) []byte {
+	seqCount := 0
+	for _, s := range seqs {
+		if s.matchLen > 0 {
+			seqCount++
+		}
+	}
 
-// encodeL2 compresses src using dual hash tables, rep-offset matching, and
-// optional Huffman compression of the literal stream.
-// Output is block-type 0x00 (raw) or 0x01 (huff literals), raw token seqs.
-func encodeL2(src []byte, st *encoderState) []byte {
+	dst := make([]byte, 0, 1+3+len(litBuf)+3+seqCount*4+32)
+	dst = append(dst, 0x04)
+	litLen := len(litBuf)
+	dst = append(dst, byte(litLen), byte(litLen>>8), byte(litLen>>16))
+	dst = append(dst, litBuf...)
+	dst = append(dst, byte(seqCount), byte(seqCount>>8), byte(seqCount>>16))
+
+	for _, s := range seqs {
+		if s.matchLen == 0 {
+			continue
+		}
+		dst = appendToken(dst, int(s.litLen), int(s.matchLen-minMatch))
+		dst = append(dst, byte(s.offset), byte(s.offset>>8), byte(s.offset>>16))
+	}
+
+	return dst
+}
+
+// ─── Level 2: dual hash + recent-offset LRU + Huffman literals + FSE seqs ────
+
+// encodeL2 compresses src using dual hash tables and rep-offset matching.
+// Returns (litBuf, seqs) for assembly via buildFSEBlock (block type 0x02).
+// Rep-match offsets are stored as actual distances so the FSE sequence format
+// (which has no rep-match shorthand in L2) can encode them directly.
+func encodeL2(src []byte, st *encoderState) (litBuf []byte, seqs []sequence) {
 	cfg := levelConfigs[Level2]
 	st.dual.reset()
 	st.recentOff = [3]uint32{1, 4, 8}
 	st.litBuf = st.litBuf[:0]
 
-	// Collect sequences
-	seqs := st.seqs[:0]
+	seqs = st.seqs[:0]
 	anchor := 0
 	si := 0
 	sn := len(src) - inputMargin
@@ -177,20 +214,17 @@ func encodeL2(src []byte, st *encoderState) []byte {
 		bestRef, bestLen := findBestMatch2(src, si, refS, refL, window, st.recentOff)
 		if bestLen >= minMatch {
 			var off uint32
-			var ri uint8
-			if bestRef < 0 { // rep match
-				ri = uint8(-bestRef - 1)
-				st.updateRecent(st.recentOff[ri]) // mirror decoder LRU rotation
-				off = 0
+			if bestRef < 0 { // rep match: store actual offset so FSE can encode it
+				ri := uint8(-bestRef - 1)
+				off = st.recentOff[ri]
 			} else {
 				off = uint32(si - bestRef)
-				st.updateRecent(off)
 			}
+			st.naivePushRecent(off)
 			seqs = append(seqs, sequence{
 				litLen:   uint32(si - anchor),
 				matchLen: uint32(bestLen),
 				offset:   off,
-				repIdx:   ri,
 			})
 			si += bestLen
 			anchor = si
@@ -198,24 +232,17 @@ func encodeL2(src []byte, st *encoderState) []byte {
 			si++
 		}
 	}
-	// tail literals (no match)
 	seqs = append(seqs, sequence{litLen: uint32(len(src) - anchor)})
 	st.seqs = seqs
 
-	// Build literal buffer
-	litBuf := st.litBuf
+	litBuf = st.litBuf
 	pos := 0
 	for _, s := range seqs {
 		litBuf = append(litBuf, src[pos:pos+int(s.litLen)]...)
 		pos += int(s.litLen) + int(s.matchLen)
 	}
 	st.litBuf = litBuf
-
-	// Try Huffman-compress literals
-	huffOut, _, err := huff0.Compress1X(litBuf, st.hScratch)
-	useHuff := err == nil && len(huffOut) < len(litBuf)
-
-	return buildRawSeqBlock(src, seqs, litBuf, huffOut, useHuff)
+	return litBuf, seqs
 }
 
 // findBestMatch2 tries rep offsets first, then short/long hash candidates.
@@ -326,13 +353,15 @@ func buildRawSeqBlock(src []byte, seqs []sequence, litBuf, huffOut []byte, useHu
 // ─── Level 3: dual hash + lazy(1) + Huffman + FSE ────────────────────────────
 
 // encodeL3 compresses src with lazy matching and full entropy coding.
-// Returns (blockType, litBuf, seqs) for assembly by block.go.
+// Returns (litBuf, seqs) for assembly by block.go.
 func encodeL3(src []byte, st *encoderState) (litBuf []byte, seqs []sequence) {
-	return encodeLazy(src, st, levelConfigs[Level3], 1)
+	cfg := levelConfigs[Level3]
+	return encodeLazy(src, st, cfg, cfg.lazyDepth)
 }
 
 func encodeL4(src []byte, st *encoderState) (litBuf []byte, seqs []sequence) {
-	return encodeLazy(src, st, levelConfigs[Level4], 2)
+	cfg := levelConfigs[Level4]
+	return encodeLazy(src, st, cfg, cfg.lazyDepth)
 }
 
 // encodeLazy implements lazy match evaluation at the given depth (1 or 2).
@@ -489,9 +518,8 @@ func findBestMatch3(src []byte, si, refS, refL, window int, recent [3]uint32, ch
 // ─── Level 5: optimal parse ──────────────────────────────────────────────────
 
 // encodeL5 uses a price-based optimal parse for maximum compression.
-// Falls back to encodeLazy for very small or very large inputs.
 func encodeL5(src []byte, st *encoderState) (litBuf []byte, seqs []sequence) {
-	if len(src) > 256<<10 || len(src) <= inputMargin {
+	if len(src) <= inputMargin {
 		return encodeLazy(src, st, levelConfigs[Level5], 2)
 	}
 	return optimalParse(src, st, levelConfigs[Level5])
@@ -502,20 +530,50 @@ func optimalParse(src []byte, st *encoderState, cfg levelConfig) ([]byte, []sequ
 	n := len(src)
 	const inf = 1 << 30
 
+	// Use pre-allocated DP arrays from encoderState when available.
 	// cost[i] = minimum bit-cost to represent src[0:i]
-	cost := make([]int, n+1)
 	// from[i]: negative = literal (-1 means one literal); positive = match length
-	from := make([]int32, n+1)
 	// fromRef[i]: reference position for the match ending at i (valid when from[i] > 0)
-	fromRef := make([]int32, n+1)
+	var cost []int
+	var from, fromRef []int32
+	if len(st.dpCost) >= n+1 {
+		cost = st.dpCost[:n+1]
+		from = st.dpFrom[:n+1]
+		fromRef = st.dpFromRef[:n+1]
+	} else {
+		cost = make([]int, n+1)
+		from = make([]int32, n+1)
+		fromRef = make([]int32, n+1)
+	}
 	for i := range cost {
 		cost[i] = inf
 	}
+	clear(from)
+	clear(fromRef)
 	cost[0] = 0
 
 	st.recentOff = [3]uint32{1, 4, 8}
 	st.dual.reset()
+	if st.chainTable != nil {
+		clear(st.chainTable)
+	}
 	window := cfg.windowSize
+
+	tryMatch := func(i, ref int) {
+		if ref < 0 || ref >= i || i-ref >= window {
+			return
+		}
+		if load32(src, ref) != load32(src, i) {
+			return
+		}
+		mLen := minMatch + extendMatch(src, i+minMatch, ref+minMatch, n-5)
+		mc := cost[i] + matchPrice(mLen, uint32(i-ref))
+		if mc < cost[i+mLen] {
+			cost[i+mLen] = mc
+			from[i+mLen] = int32(mLen)
+			fromRef[i+mLen] = int32(ref)
+		}
+	}
 
 	for i := 0; i < n; i++ {
 		if cost[i] == inf {
@@ -540,21 +598,38 @@ func optimalParse(src []byte, st *encoderState, cfg levelConfig) ([]byte, []sequ
 		refL := st.dual.long.get(hl)
 		st.dual.short.set(hs, i)
 		st.dual.long.set(hl, i)
+		if st.chainTable != nil {
+			st.chainTable[i&st.chainMask] = int32(refS)
+		}
 
-		candidates := [2]int{refS, refL}
-		for _, ref := range candidates {
-			if ref >= i || i-ref >= window || ref < 0 {
-				continue
+		// Walk short hash chain up to chainDepth candidates.
+		candidate := refS
+		depth := cfg.chainDepth
+		if depth == 0 {
+			depth = 1
+		}
+		for k := 0; k < depth && candidate >= 0 && candidate < i && i-candidate < window; k++ {
+			tryMatch(i, candidate)
+			if st.chainTable == nil {
+				break
 			}
-			if load32(src, ref) != load32(src, i) {
-				continue
+			next := int(st.chainTable[candidate&st.chainMask])
+			if next >= candidate {
+				break
 			}
-			mLen := minMatch + extendMatch(src, i+minMatch, ref+minMatch, n-5)
-			matchCost := 24 + 16 // rough: 3 bytes token + 2 bytes offset
-			if base+matchCost < cost[i+mLen] {
-				cost[i+mLen] = base + matchCost
-				from[i+mLen] = int32(mLen)
-				fromRef[i+mLen] = int32(ref)
+			candidate = next
+		}
+
+		// Try long hash candidate (single candidate, 8-byte fingerprint).
+		if refL >= 0 && refL < i && i-refL < window && i+8 <= n {
+			if load64(src, refL) == load64(src, i) {
+				mLen := 8 + extendMatch(src, i+8, refL+8, n-5)
+				mc := cost[i] + matchPrice(mLen, uint32(i-refL))
+				if mc < cost[i+mLen] {
+					cost[i+mLen] = mc
+					from[i+mLen] = int32(mLen)
+					fromRef[i+mLen] = int32(refL)
+				}
 			}
 		}
 	}

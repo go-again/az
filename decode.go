@@ -10,8 +10,6 @@ import (
 
 // decompressBlock dispatches to the correct decoder based on the block-type
 // byte (first byte of the compressed block body).
-// dst must be pre-allocated to the expected uncompressed size, or nil to let
-// the decoder allocate.
 func decompressBlock(src []byte, uncompressedHint int) ([]byte, error) {
 	if len(src) == 0 {
 		return nil, ErrCorrupted
@@ -28,6 +26,8 @@ func decompressBlock(src []byte, uncompressedHint int) ([]byte, error) {
 		return decodeBlockFull(src, uncompressedHint)
 	case 0x03:
 		return decodeRLE(src)
+	case 0x04:
+		return decodeBlockCompact(src, uncompressedHint)
 	default:
 		return nil, fmt.Errorf("%w: unknown block type 0x%02x", ErrCorrupted, blockType)
 	}
@@ -81,8 +81,8 @@ func decodeBlockHuffRaw(src []byte, hint int) ([]byte, error) {
 }
 
 // decodeRawSeqs reconstructs the output from a literal buffer and a
-// sequence stream produced by buildRawSeqBlock.
-// largeWindow=true means offsets are 4 bytes; false means 2 bytes.
+// sequence stream produced by buildRawSeqBlock (block types 0x00 and 0x01).
+// largeWindow=true means offsets are 4 bytes.
 func decodeRawSeqs(lits, seqSrc []byte, hint int, largeWindow bool) ([]byte, error) {
 	dst := make([]byte, 0, hint)
 	litPos := 0
@@ -171,7 +171,6 @@ func decodeRawSeqs(lits, seqSrc []byte, hint int, largeWindow bool) ([]byte, err
 				offset = int(binary.LittleEndian.Uint32(seqSrc[:4]))
 				seqSrc = seqSrc[4:]
 			}
-			// Update recent offsets
 			recent[2] = recent[1]
 			recent[1] = recent[0]
 			recent[0] = uint32(offset)
@@ -181,7 +180,6 @@ func decodeRawSeqs(lits, seqSrc []byte, hint int, largeWindow bool) ([]byte, err
 			return nil, ErrCorrupted
 		}
 
-		// Copy match (may overlap)
 		dst = copyMatch(dst, offset, mLen)
 	}
 
@@ -190,6 +188,15 @@ func decodeRawSeqs(lits, seqSrc []byte, hint int, largeWindow bool) ([]byte, err
 
 // ─── Block type 0x02: Huffman literals + FSE sequences ──────────────────────
 
+// decodeBlockFull decodes a block-type-0x02 payload.
+//
+// Sequence section format:
+//   [seqCount:u24]
+//   [llCodes: 3-byte-prefixed, FSE or raw]
+//   [mlCodes: 3-byte-prefixed, FSE or raw]
+//   [ofCodes: 3-byte-prefixed, FSE or raw]
+//   [extraBitsLen:u24]
+//   [extraBitsBuf: packed LE bits, per seq: ll_extra || ml_extra || of_extra]
 func decodeBlockFull(src []byte, hint int) ([]byte, error) {
 	if len(src) < 6 {
 		return nil, ErrCorrupted
@@ -214,7 +221,6 @@ func decodeBlockFull(src []byte, hint int) ([]byte, error) {
 		huffSrc := src[:huffSize]
 		src = src[huffSize:]
 
-		// Decode Huffman-compressed literals.
 		hsc, remain, err := huff0.ReadTable(huffSrc, nil)
 		if err != nil {
 			return nil, fmt.Errorf("%w: huff0 read table: %v", ErrCorrupted, err)
@@ -244,27 +250,33 @@ func decodeBlockFull(src []byte, hint int) ([]byte, error) {
 		return lits, nil
 	}
 
-	// litLen values: seqCount * 3 bytes (uint24 LE each), no size prefix.
-	llBufSize := seqCount * 3
-	if len(src) < llBufSize {
-		return nil, ErrCorrupted
+	// Read three FSE/raw code streams: ll, ml, of
+	var err error
+	llCodes, src, err := readSeqStream(src, seqCount)
+	if err != nil {
+		return nil, fmt.Errorf("%w: fse llCodes: %v", ErrCorrupted, err)
 	}
-	llBuf := src[:llBufSize]
-	src = src[llBufSize:]
-
-	// matchLen-excess values: seqCount * 3 bytes (uint24 LE each), no size prefix.
-	mlBufSize := seqCount * 3
-	if len(src) < mlBufSize {
-		return nil, ErrCorrupted
+	mlCodes, src, err := readSeqStream(src, seqCount)
+	if err != nil {
+		return nil, fmt.Errorf("%w: fse mlCodes: %v", ErrCorrupted, err)
 	}
-	mlBuf := src[:mlBufSize]
-	src = src[mlBufSize:]
-
-	// Offset code stream: size-prefixed, high bit of size = isRaw flag.
 	ofCodes, src, err := readSeqStream(src, seqCount)
 	if err != nil {
-		return nil, fmt.Errorf("%w: fse offset: %v", ErrCorrupted, err)
+		return nil, fmt.Errorf("%w: fse ofCodes: %v", ErrCorrupted, err)
 	}
+
+	// Read packed extra bits
+	if len(src) < 3 {
+		return nil, ErrCorrupted
+	}
+	ebLen := int(src[0]) | int(src[1])<<8 | int(src[2])<<16
+	src = src[3:]
+	if len(src) < ebLen {
+		return nil, ErrCorrupted
+	}
+	var ebr extraBitReader
+	ebr.init(src[:ebLen])
+	// src beyond the extra bits is ignored (should be empty for a well-formed block)
 
 	// Decode sequences
 	dst := make([]byte, 0, hint)
@@ -272,33 +284,56 @@ func decodeBlockFull(src []byte, hint int) ([]byte, error) {
 	var recent [3]uint32 = [3]uint32{1, 4, 8}
 
 	for i := 0; i < seqCount; i++ {
-		base := i * 3
-		lLen := int(llBuf[base]) | int(llBuf[base+1])<<8 | int(llBuf[base+2])<<16
-		mleRaw := int(mlBuf[base]) | int(mlBuf[base+1])<<8 | int(mlBuf[base+2])<<16
-		mLen := mleRaw + minMatch
+		llCode := llCodes[i]
+		mlCode := mlCodes[i]
 		ofCode := ofCodes[i]
 
+		// Decode litLen
+		if int(llCode) >= len(llBase) {
+			return nil, ErrCorrupted
+		}
+		lLen := int(llBase[llCode])
+		if n := uint(llBits[llCode]); n > 0 {
+			extra, e := ebr.readBits(n)
+			if e != nil {
+				return nil, e
+			}
+			lLen += int(extra)
+		}
+
+		// Decode matchLen excess → mLen
+		if int(mlCode) >= len(mlBase) {
+			return nil, ErrCorrupted
+		}
+		mlExcess := int(mlBase[mlCode])
+		if n := uint(mlBits[mlCode]); n > 0 {
+			extra, e := ebr.readBits(n)
+			if e != nil {
+				return nil, e
+			}
+			mlExcess += int(extra)
+		}
+		mLen := mlExcess + minMatch
+
+		// Decode offset
 		var offset int
 		if ofCode < 3 {
-			// rep match
+			// Rep match (not produced by current encoder but handled for completeness)
 			idx := int(ofCode)
 			offset = int(recent[idx])
-			// rotate LRU
 			if idx > 0 {
 				recent[idx], recent[idx-1] = recent[idx-1], recent[idx]
 			}
 		} else {
-			// code = bit_length(offset) + 2; base = 1 << (code-3); extra bits = code-3
-			extraBits := int(ofCode) - 3
+			extraBits := uint(ofCode) - 3
+			base := uint32(1) << extraBits
 			var extra uint32
 			if extraBits > 0 {
-				if len(src) < 4 {
-					return nil, ErrCorrupted
+				extra, err = ebr.readBits(extraBits)
+				if err != nil {
+					return nil, err
 				}
-				extra = binary.LittleEndian.Uint32(src[:4]) & ((1 << extraBits) - 1)
-				src = src[4:]
 			}
-			base := uint32(1) << extraBits
 			offset = int(base + extra)
 			recent[2] = recent[1]
 			recent[1] = recent[0]
@@ -364,10 +399,87 @@ func fseDecompress(src []byte, count int) ([]byte, error) {
 	return out, nil
 }
 
-// decodeSeqValue maps a packed sequence code byte to its decoded value.
-// Literal lengths and match lengths are stored directly in the byte (0-255).
-func decodeSeqValue(code byte) uint32 {
-	return uint32(code)
+// ─── Block type 0x04: compact raw seqs (no flag byte, 3-byte offset) ─────────
+
+// decodeBlockCompact decodes a block-type-0x04 payload produced by buildCompactSeqBlock.
+// Format: [litLen:u24][lits][seqCount:u24] then per-seq [token][overflow...][offset:3].
+// After seqCount sequences, remaining lits are appended as trailing literals.
+func decodeBlockCompact(src []byte, hint int) ([]byte, error) {
+	if len(src) < 3 {
+		return nil, ErrCorrupted
+	}
+	litLen := int(src[0]) | int(src[1])<<8 | int(src[2])<<16
+	src = src[3:]
+	if len(src) < litLen {
+		return nil, ErrCorrupted
+	}
+	lits := src[:litLen]
+	src = src[litLen:]
+
+	if len(src) < 3 {
+		return nil, ErrCorrupted
+	}
+	seqCount := int(src[0]) | int(src[1])<<8 | int(src[2])<<16
+	src = src[3:]
+
+	dst := make([]byte, 0, hint)
+	litPos := 0
+
+	for i := 0; i < seqCount; i++ {
+		if len(src) < 1 {
+			return nil, ErrCorrupted
+		}
+		token := src[0]
+		src = src[1:]
+
+		litTag := int(token >> 4)
+		matchTag := int(token & 0x0F)
+
+		lLen := litTag
+		if litTag == 15 {
+			for len(src) > 0 {
+				extra := int(src[0])
+				src = src[1:]
+				lLen += extra
+				if extra < 255 {
+					break
+				}
+			}
+		}
+
+		mLenEx := matchTag
+		if matchTag == 15 {
+			for len(src) > 0 {
+				extra := int(src[0])
+				src = src[1:]
+				mLenEx += extra
+				if extra < 255 {
+					break
+				}
+			}
+		}
+		mLen := mLenEx + minMatch
+
+		if len(src) < 3 {
+			return nil, ErrCorrupted
+		}
+		offset := int(src[0]) | int(src[1])<<8 | int(src[2])<<16
+		src = src[3:]
+
+		if litPos+lLen > len(lits) {
+			return nil, ErrCorrupted
+		}
+		dst = append(dst, lits[litPos:litPos+lLen]...)
+		litPos += lLen
+
+		if offset <= 0 || offset > len(dst) {
+			return nil, ErrCorrupted
+		}
+		dst = copyMatch(dst, offset, mLen)
+	}
+
+	dst = append(dst, lits[litPos:]...)
+	return dst, nil
 }
 
 // ─── Block type 0x03: RLE ────────────────────────────────────────────────────
@@ -392,10 +504,8 @@ func decodeRLE(src []byte) ([]byte, error) {
 func copyMatch(dst []byte, offset, mLen int) []byte {
 	start := len(dst) - offset
 	if start < 0 {
-		// Should not happen with valid data
 		return dst
 	}
-	// Overlap-safe copy
 	for mLen > 0 {
 		n := mLen
 		avail := len(dst) - start
@@ -403,7 +513,7 @@ func copyMatch(dst []byte, offset, mLen int) []byte {
 			n = avail
 		}
 		dst = append(dst, dst[start:start+n]...)
-		start += n // advance for potential next iteration (repeating pattern)
+		start += n
 		mLen -= n
 	}
 	return dst

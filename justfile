@@ -81,41 +81,45 @@ compare target: build
     fi
 
     ORIG=$(wc -c < "$SRC" | tr -d ' ')
+    AZ="{{ az_bin }}"
     echo ""
     echo "Source: $SRC  ($ORIG bytes)"
     echo ""
-    printf "%-20s %-12s %-12s %-10s\n" "Algorithm" "Output (B)" "Ratio" "Time"
-    printf "%-20s %-12s %-12s %-10s\n" "---------" "----------" "-----" "----"
+    printf "%-20s %-12s %-12s %-12s %-10s\n" "Algorithm" "Output (B)" "Ratio" "Compress" "Decompress"
+    printf "%-20s %-12s %-12s %-12s %-10s\n" "---------" "----------" "-----" "--------" "----------"
 
-    _compress_and_report() {
-        local label="$1"; shift
-        local out="$1"; shift
-        local t0 t1 elapsed size ratio
+    _bench() {
+        local label="$1" out="$2" decomp="$3"; shift 3
+        local t0 t1 ctime dtime size ratio
         t0=$(python3 -c "import time; print(time.time())")
         "$@" < "$SRC" > "$out"
         t1=$(python3 -c "import time; print(time.time())")
-        elapsed=$(python3 -c "print(f'{$t1 - $t0:.2f}s')")
+        ctime=$(python3 -c "print(f'{$t1-$t0:.2f}s')")
+        t0=$(python3 -c "import time; print(time.time())")
+        eval "$decomp \"$out\"" > /dev/null 2>&1
+        t1=$(python3 -c "import time; print(time.time())")
+        dtime=$(python3 -c "print(f'{$t1-$t0:.2f}s')")
         size=$(wc -c < "$out" | tr -d ' ')
         ratio=$(python3 -c "print(f'{$size/$ORIG:.3f}')")
-        printf "%-20s %-12s %-12s %-10s\n" "$label" "$size" "$ratio" "$elapsed"
+        printf "%-20s %-12s %-12s %-12s %-10s\n" "$label" "$size" "$ratio" "$ctime" "$dtime"
     }
 
-    _compress_and_report "az -1"    "$OUT/out.az1"   {{ az_bin }} -c -1
-    _compress_and_report "az -2"    "$OUT/out.az2"   {{ az_bin }} -c -2
-    _compress_and_report "az -3"    "$OUT/out.az3"   {{ az_bin }} -c -3
-    _compress_and_report "az -4"    "$OUT/out.az4"   {{ az_bin }} -c -4
-    _compress_and_report "az -5"    "$OUT/out.az5"   {{ az_bin }} -c -5
-    _compress_and_report "lz4"      "$OUT/out.lz4"   lz4 -c
-    _compress_and_report "lz4 -9"   "$OUT/out.lz4-9" lz4 -9 -c
-    _compress_and_report "gzip -1"  "$OUT/out.gz1"   gzip -1 -c
-    _compress_and_report "gzip -6"  "$OUT/out.gz6"   gzip -6 -c
-    _compress_and_report "gzip -9"  "$OUT/out.gz9"   gzip -9 -c
-    _compress_and_report "zstd -1"  "$OUT/out.zst1"  zstd -1 -c
-    _compress_and_report "zstd -3"  "$OUT/out.zst3"  zstd -3 -c
-    _compress_and_report "zstd -9"  "$OUT/out.zst9"  zstd -9 -c
-    _compress_and_report "zstd -19" "$OUT/out.zst19" zstd -19 -c
-    _compress_and_report "xz -1"    "$OUT/out.xz1"   xz -1 -c
-    _compress_and_report "xz -6"    "$OUT/out.xz6"   xz -6 -c
+    _bench "az -1"    "$OUT/out.az1"   "$AZ -d -c"    $AZ -c -1
+    _bench "az -2"    "$OUT/out.az2"   "$AZ -d -c"    $AZ -c -2
+    _bench "az -3"    "$OUT/out.az3"   "$AZ -d -c"    $AZ -c -3
+    _bench "az -4"    "$OUT/out.az4"   "$AZ -d -c"    $AZ -c -4
+    _bench "az -5"    "$OUT/out.az5"   "$AZ -d -c"    $AZ -c -5
+    _bench "lz4"      "$OUT/out.lz4"   "lz4 -d -c"    lz4 -c
+    _bench "lz4 -9"   "$OUT/out.lz4-9" "lz4 -d -c"    lz4 -9 -c
+    _bench "gzip -1"  "$OUT/out.gz1"   "gzip -d -c"   gzip -1 -c
+    _bench "gzip -6"  "$OUT/out.gz6"   "gzip -d -c"   gzip -6 -c
+    _bench "gzip -9"  "$OUT/out.gz9"   "gzip -d -c"   gzip -9 -c
+    _bench "zstd -1"  "$OUT/out.zst1"  "zstd -d -c"   zstd -1 -c
+    _bench "zstd -3"  "$OUT/out.zst3"  "zstd -d -c"   zstd -3 -c
+    _bench "zstd -9"  "$OUT/out.zst9"  "zstd -d -c"   zstd -9 -c
+    _bench "zstd -19" "$OUT/out.zst19" "zstd -d -c"   zstd -19 -c
+    _bench "xz -1"    "$OUT/out.xz1"   "xz -d -c"     xz -1 -c
+    _bench "xz -6"    "$OUT/out.xz6"   "xz -d -c"     xz -6 -c
     echo ""
     echo "Output files in $OUT"
 
