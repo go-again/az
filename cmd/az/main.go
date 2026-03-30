@@ -1,4 +1,4 @@
-// Command az compresses and decompresses files using the az format.
+// Command az compresses and decompresses files.
 //
 // Usage:
 //
@@ -16,6 +16,14 @@
 //
 // With no FILE, or when FILE is -, read from stdin and write to stdout.
 // Compressed files get the .az suffix; decompression removes it.
+//
+// Compression levels:
+//
+//	-1   Fastest (lz4 level 3)
+//	-2   Fast    (lz4 level 6)
+//	-3   Default (zstd level 6)
+//	-4   Better  (zstd level 12)
+//	-5   Best    (zstd level 18)
 package main
 
 import (
@@ -28,7 +36,7 @@ import (
 	"strings"
 	"time"
 
-	"az"
+	"github.com/go-again/az"
 )
 
 func main() {
@@ -38,15 +46,16 @@ func main() {
 func run() int {
 	// ── Flag parsing ──────────────────────────────────────────────────────────
 	var (
-		level1, level2, level3, level4, level5 bool
-		decompress, keep, stdout, force, test, verbose, noChecksum bool
-		outputFile string
+		level1, level2, level3, level4, level5              bool
+		decompress, keep, stdout, force, test, verbose      bool
+		noChecksum                                          bool
+		outputFile                                          string
 	)
-	flag.BoolVar(&level1, "1", false, "compression level 1 (fastest)")
-	flag.BoolVar(&level2, "2", false, "compression level 2")
-	flag.BoolVar(&level3, "3", false, "compression level 3 (default)")
-	flag.BoolVar(&level4, "4", false, "compression level 4")
-	flag.BoolVar(&level5, "5", false, "compression level 5 (best)")
+	flag.BoolVar(&level1, "1", false, "fastest (lz4 level 3)")
+	flag.BoolVar(&level2, "2", false, "fast (lz4 level 6)")
+	flag.BoolVar(&level3, "3", false, "default (zstd level 6)")
+	flag.BoolVar(&level4, "4", false, "better (zstd level 12)")
+	flag.BoolVar(&level5, "5", false, "best (zstd level 18)")
 	flag.BoolVar(&decompress, "d", false, "decompress")
 	flag.BoolVar(&decompress, "decompress", false, "decompress")
 	flag.BoolVar(&keep, "k", false, "keep source files")
@@ -145,7 +154,6 @@ func processFile(srcPath, dstPath string, decompress, keep, toStdout, force, tes
 		}
 		tmpName := tmp.Name()
 		defer func() {
-			// Clean up temp file on error (best effort).
 			os.Remove(tmpName)
 		}()
 		out = &renameCloser{File: tmp, dst: dstPath}
@@ -154,11 +162,13 @@ func processFile(srcPath, dstPath string, decompress, keep, toStdout, force, tes
 	start := time.Now()
 	var inBytes, outBytes int64
 
+	cw := &countWriter{w: out}
 	if decompress {
-		inBytes, outBytes, err = copyDecompress(in, out)
+		inBytes, outBytes, err = copyDecompress(in, cw)
 	} else {
-		inBytes, outBytes, err = copyCompress(in, out, level, noChecksum)
+		inBytes, outBytes, err = copyCompress(in, cw, level, noChecksum)
 	}
+	_ = outBytes // outBytes tracked via cw.n
 
 	if err != nil {
 		out.Close()
@@ -174,16 +184,16 @@ func processFile(srcPath, dstPath string, decompress, keep, toStdout, force, tes
 		speed := float64(inBytes) / elapsed / (1 << 20)
 		var ratio float64
 		if decompress {
-			if outBytes > 0 {
-				ratio = float64(inBytes) / float64(outBytes)
+			if cw.n > 0 {
+				ratio = float64(inBytes) / float64(cw.n)
 			}
 		} else {
 			if inBytes > 0 {
-				ratio = float64(outBytes) / float64(inBytes)
+				ratio = float64(cw.n) / float64(inBytes)
 			}
 		}
 		fmt.Fprintf(os.Stderr, "%s: %d → %d bytes (%.3f ratio, %.1f MB/s)\n",
-			srcPath, inBytes, outBytes, ratio, speed)
+			srcPath, inBytes, cw.n, ratio, speed)
 	}
 
 	if !keep && !toStdout && !test {
@@ -194,13 +204,14 @@ func processFile(srcPath, dstPath string, decompress, keep, toStdout, force, tes
 
 func runStream(in io.Reader, out io.Writer, decompress bool, level az.Level, noChecksum, verbose bool, name string) int {
 	start := time.Now()
-	var inBytes, outBytes int64
+	var inBytes int64
 	var err error
 
+	cw := &countWriter{w: out}
 	if decompress {
-		inBytes, outBytes, err = copyDecompress(in, nopCloser{out})
+		inBytes, _, err = copyDecompress(in, cw)
 	} else {
-		inBytes, outBytes, err = copyCompress(in, nopCloser{out}, level, noChecksum)
+		inBytes, _, err = copyCompress(in, cw, level, noChecksum)
 	}
 
 	if err != nil {
@@ -211,12 +222,12 @@ func runStream(in io.Reader, out io.Writer, decompress bool, level az.Level, noC
 	if verbose {
 		elapsed := time.Since(start).Seconds()
 		speed := float64(inBytes) / elapsed / (1 << 20)
-		fmt.Fprintf(os.Stderr, "%s: %d → %d bytes (%.1f MB/s)\n", name, inBytes, outBytes, speed)
+		fmt.Fprintf(os.Stderr, "%s: %d → %d bytes (%.1f MB/s)\n", name, inBytes, cw.n, speed)
 	}
 	return 0
 }
 
-func copyCompress(in io.Reader, out io.WriteCloser, level az.Level, noChecksum bool) (inBytes, outBytes int64, err error) {
+func copyCompress(in io.Reader, out io.Writer, level az.Level, noChecksum bool) (inBytes, outBytes int64, err error) {
 	opts := []az.Option{az.WithLevel(level)}
 	if noChecksum {
 		opts = append(opts, az.WithChecksum(false))
@@ -227,11 +238,10 @@ func copyCompress(in io.Reader, out io.WriteCloser, level az.Level, noChecksum b
 		return
 	}
 	err = cw.Close()
-	// outBytes not easily tracked without wrapping, leave as 0
 	return
 }
 
-func copyDecompress(in io.Reader, out io.WriteCloser) (inBytes, outBytes int64, err error) {
+func copyDecompress(in io.Reader, out io.Writer) (inBytes, outBytes int64, err error) {
 	cr := az.NewReader(in)
 	defer cr.Close()
 	outBytes, err = io.Copy(out, cr)
@@ -259,4 +269,23 @@ func (rc *renameCloser) Close() error {
 		return err
 	}
 	return os.Rename(rc.File.Name(), rc.dst)
+}
+
+// countWriter counts bytes written through it.
+type countWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (cw *countWriter) Write(p []byte) (int, error) {
+	n, err := cw.w.Write(p)
+	cw.n += int64(n)
+	return n, err
+}
+
+func (cw *countWriter) Close() error {
+	if c, ok := cw.w.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }

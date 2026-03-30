@@ -1,17 +1,15 @@
 # az
 
-A general-purpose compression library and CLI tool for Go.
-
-`az` combines LZ77 back-reference matching with Huffman and FSE (Finite State
-Entropy) coding to deliver competitive compression ratios at high throughput.
-It has **no external dependencies** — entropy codecs are vendored under `pkg/`.
+A general-purpose compression library and CLI tool for Go, built on top of
+**LZ4** (levels 1–2) and **Zstandard** (levels 3–5).  No external imports —
+the algorithm implementations are vendored under `internal/`.
 
 ---
 
 ## Installation
 
 ```sh
-go install az/cmd/az@latest
+go install github.com/go-again/az/cmd/az@latest
 ```
 
 Or build from source:
@@ -30,11 +28,11 @@ go build -o az ./cmd/az
 az [OPTIONS] [FILE...]
 
 Compression levels:
-  -1              Fastest  — pure LZ77, no entropy (≈ LZ4 speed)
-  -2              Fast     — dual hash + Huffman literals
-  -3              Default  — lazy match + Huffman + FSE sequences
-  -4              Better   — deeper search + chain matching
-  -5              Best     — optimal parse
+  -1              Fastest  — lz4 fast  (ratio ~0.36, ~550 MB/s on text)
+  -2              Fast     — lz4 HC    (ratio ~0.29, ~290 MB/s on text)
+  -3              Default  — zstd-6    (ratio ~0.18, ~350 MB/s on text)
+  -4              Better   — zstd-12   (ratio ~0.16, ~270 MB/s on text)
+  -5              Best     — zstd-18   (ratio ~0.15,  ~60 MB/s on text)
 
 Modes:
   -d, --decompress    Decompress
@@ -44,7 +42,7 @@ Modes:
   -t, --test          Test integrity (decompress to /dev/null)
   -v, --verbose       Print compression ratio and speed
   -o FILE             Output filename (single input only)
-  --no-checksum       Disable block checksums
+  --no-checksum       Disable checksums
 
 With no FILE, or when FILE is -, reads stdin and writes stdout.
 Compressed files get the .az suffix; decompression removes it.
@@ -67,7 +65,7 @@ cat data.bin | az -c | az -d -c > data.bin
 
 # Verbose output
 az -v -3 largefile.bin
-# → largefile.bin: 104857600 → 41943040 bytes (0.400 ratio, 312.5 MB/s)
+# → largefile.bin: 104857600 → 19203051 bytes (0.183 ratio, 351.0 MB/s)
 
 # Test integrity without writing output
 az -t archive.az
@@ -82,7 +80,7 @@ tar -xf - < <(az -d -c mydir.tar.az)
 ## Go Package API
 
 ```go
-import "az"
+import "github.com/go-again/az"
 
 // One-shot compress/decompress
 compressed, err := az.Compress(data, az.Level3)
@@ -96,7 +94,7 @@ w := az.NewWriter(dst,
 w.Write(data)
 w.Close()
 
-// Streaming reader
+// Streaming reader — auto-detects lz4 or zstd format
 r := az.NewReader(src)
 io.Copy(dst, r)
 r.Close()
@@ -111,56 +109,81 @@ r.Reset(newSrc)
 | Option | Default | Description |
 |--------|---------|-------------|
 | `WithLevel(l)` | `Level3` | Compression level 1–5 |
-| `WithChecksum(b)` | `true` | Per-block + content XXH64 checksum |
-| `WithContentSize(b)` | `false` | Embed uncompressed size in frame header |
+| `WithChecksum(b)` | `true` | Enable/disable frame checksums |
+| `WithContentSize(b)` | `false` | Embed uncompressed size (one-shot only) |
 
 ---
 
 ## Compression Levels
 
-| Level | Name | Block/Window | Strategy | Literals | Sequences |
-|-------|------|-------------|----------|----------|-----------|
-| 1 | Fastest | 8 MB | Single hash, greedy | Raw | Compact tokens, 3-byte offset |
-| 2 | Fast | 8 MB | Dual hash + rep×3, greedy | Huffman 1X/4X | FSE compact codes |
-| 3 | Default | 8 MB | Dual hash + chain(8), lazy(2) | Huffman 1X/4X | FSE compact codes |
-| 4 | Better | 8 MB | Dual hash + chain(32), lazy(4) | Huffman 1X/4X | FSE compact codes |
-| 5 | Best | 8 MB | Dual hash + chain(4), optimal parse | Huffman 1X/4X | FSE compact codes |
+| Level | Algorithm | Compress | Decompress | Ratio |
+|-------|-----------|----------|------------|-------|
+| `-1` fastest | lz4 fast | ~547 MB/s | ~736 MB/s | 0.359 |
+| `-2` fast | lz4 HC | ~289 MB/s | ~736 MB/s | 0.294 |
+| `-3` default | zstd-6 | ~351 MB/s | ~615 MB/s | 0.183 |
+| `-4` better | zstd-12 | ~273 MB/s | ~703 MB/s | 0.162 |
+| `-5` best | zstd-18 | ~59 MB/s | ~703 MB/s | 0.147 |
 
-All levels use goroutine-based parallel block compression (up to 8 workers).
-Incompressible blocks are stored verbatim regardless of level.
+## Comparison
+
+Measured on Apple M2 Max. Source: `/usr/share/man` tar (51 MB, text).
+
+| Algorithm | Ratio | Compress | Decompress |
+|-----------|-------|----------|------------|
+| **az -1** | 0.359 | 0.09s | 0.07s |
+| **az -2** | 0.294 | 0.17s | 0.07s |
+| **az -3** | 0.183 | 0.14s | 0.07s |
+| **az -4** | 0.162 | 0.18s | 0.07s |
+| **az -5** | 0.147 | 0.83s | 0.07s |
+| lz4 | 0.383 | 0.05s | 0.05s |
+| lz4 -9 | 0.281 | 0.16s | 0.04s |
+| gzip -1 | 0.305 | 0.36s | 0.07s |
+| gzip -6 | 0.250 | 1.09s | 0.07s |
+| gzip -9 | 0.249 | 1.56s | 0.06s |
+| zstd -1 | 0.251 | 0.06s | 0.06s |
+| zstd -3 | 0.208 | 0.07s | 0.06s |
+| zstd -9 | 0.165 | 0.21s | 0.05s |
+| zstd -19 | 0.132 | 6.21s | 0.05s |
+| xz -1 | 0.204 | 0.26s | 0.08s |
+| xz -6 | 0.135 | 6.39s | 0.19s |
+
+Source: `.compress` tar (123 MB, Go source).
+
+| Algorithm | Ratio | Compress | Decompress |
+|-----------|-------|----------|------------|
+| **az -1** | 0.946 | 0.23s | 0.07s |
+| **az -2** | 0.942 | 0.09s | 0.07s |
+| **az -3** | 0.860 | 0.12s | 0.07s |
+| **az -4** | 0.828 | 0.21s | 0.06s |
+| **az -5** | 0.814 | 1.65s | 0.07s |
+| lz4 | 0.942 | 0.06s | 0.05s |
+| lz4 -9 | 0.929 | 0.30s | 0.05s |
+| gzip -1 | 0.931 | 1.91s | 0.09s |
+| gzip -6 | 0.928 | 2.29s | 0.09s |
+| gzip -9 | 0.928 | 2.61s | 0.09s |
+| zstd -1 | 0.911 | 0.06s | 0.04s |
+| zstd -3 | 0.859 | 0.08s | 0.05s |
+| zstd -9 | 0.846 | 0.15s | 0.05s |
+| zstd -19 | 0.807 | 7.57s | 0.06s |
+| xz -1 | 0.860 | 2.46s | 0.18s |
+| xz -6 | 0.812 | 7.37s | 0.42s |
+
+Ratio = compressed / original (lower is better).
 
 ---
 
-## Comparison with Other Algorithms
+## Wire Format
 
-Run `just compare <target>` or `just bench-compare <target>` to measure on your machine.
+Levels 1–2 produce native **LZ4 frames** (magic `0x184D2204`).
+Levels 3–5 produce native **Zstandard frames** (magic `0xFD2FB528`).
+
+The decompressor auto-detects the format from the magic bytes.
+`.az` files are valid lz4 or zstd streams, so standard tools work directly:
 
 ```sh
-just compare /usr/share/man
-just compare ./myproject
+lz4 -d file.az       # if compressed with az -1 or -2
+zstd -d file.az      # if compressed with az -3, -4, or -5
 ```
-
-> Ratio = compressed / original (lower is better).
-> Results vary by data type, file size, and CPU.
-
----
-
-## Format
-
-The `.az` format is a simple framed block format:
-
-```
-Frame:  [Magic(4)] [FLG(1)] [BLK(1)] [ContentSize(8)?] [HdrCksum(4)]
-Block:  [BlockHeader(4)] [BlockData(N)] [BlockCksum(4)?]  ...
-EOS:    [0x80000000(4)] [ContentCksum(4)?]
-```
-
-- **Magic:** `0x415A0001`
-- **Block types:** compact tokens (0x04, L1), Huffman+FSE (0x02, L2–L5), raw literals+tokens (0x00/0x01, fallback), RLE (0x03)
-- **Checksums:** lower 32 bits of XXH64, per-block and end-of-stream
-- **Independent blocks:** each block decompresses without prior blocks → seekable, parallelisable
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the full specification.
 
 ---
 
