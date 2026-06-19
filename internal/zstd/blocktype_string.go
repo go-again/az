@@ -19,10 +19,11 @@ const _blockType_name = "blockTypeRawblockTypeRLEblockTypeCompressedblockTypeRes
 var _blockType_index = [...]uint8{0, 12, 24, 43, 60}
 
 func (i blockType) String() string {
-	if i >= blockType(len(_blockType_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_blockType_index)-1 {
 		return "blockType(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _blockType_name[_blockType_index[i]:_blockType_index[i+1]]
+	return _blockType_name[_blockType_index[idx]:_blockType_index[idx+1]]
 }
 func _() {
 	// An "invalid array index" compiler error signifies that the constant values have changed.
@@ -39,10 +40,11 @@ const _literalsBlockType_name = "literalsBlockRawliteralsBlockRLEliteralsBlockCo
 var _literalsBlockType_index = [...]uint8{0, 16, 32, 55, 76}
 
 func (i literalsBlockType) String() string {
-	if i >= literalsBlockType(len(_literalsBlockType_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_literalsBlockType_index)-1 {
 		return "literalsBlockType(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _literalsBlockType_name[_literalsBlockType_index[i]:_literalsBlockType_index[i+1]]
+	return _literalsBlockType_name[_literalsBlockType_index[idx]:_literalsBlockType_index[idx+1]]
 }
 func _() {
 	// An "invalid array index" compiler error signifies that the constant values have changed.
@@ -59,10 +61,11 @@ const _seqCompMode_name = "compModePredefinedcompModeRLEcompModeFSEcompModeRepea
 var _seqCompMode_index = [...]uint8{0, 18, 29, 40, 54}
 
 func (i seqCompMode) String() string {
-	if i >= seqCompMode(len(_seqCompMode_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_seqCompMode_index)-1 {
 		return "seqCompMode(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _seqCompMode_name[_seqCompMode_index[i]:_seqCompMode_index[i+1]]
+	return _seqCompMode_name[_seqCompMode_index[idx]:_seqCompMode_index[idx+1]]
 }
 func _() {
 	// An "invalid array index" compiler error signifies that the constant values have changed.
@@ -78,8 +81,9 @@ const _tableIndex_name = "tableLiteralLengthstableOffsetstableMatchLengths"
 var _tableIndex_index = [...]uint8{0, 19, 31, 48}
 
 func (i tableIndex) String() string {
-	if i >= tableIndex(len(_tableIndex_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_tableIndex_index)-1 {
 		return "tableIndex(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _tableIndex_name[_tableIndex_index[i]:_tableIndex_index[i+1]]
+	return _tableIndex_name[_tableIndex_index[idx]:_tableIndex_index[idx+1]]
 }

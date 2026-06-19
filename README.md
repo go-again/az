@@ -1,8 +1,7 @@
 # az
 
-A general-purpose compression library and CLI tool for Go, built on top of
-**LZ4** (levels 1–2) and **Zstandard** (levels 3–5).  No external imports —
-the algorithm implementations are vendored under `internal/`.
+A general-purpose compression CLI tool and library for Go, built on top of
+**LZ4** (levels 1–2) and **Zstandard** (levels 3–5).  No external imports.
 
 ---
 
@@ -28,10 +27,10 @@ go build -o az ./cmd/az
 az [OPTIONS] [FILE...]
 
 Compression levels:
-  -1              Fastest  — lz4 fast  (ratio ~0.36, ~550 MB/s on text)
-  -2              Fast     — lz4 HC    (ratio ~0.29, ~290 MB/s on text)
-  -3              Default  — zstd-6    (ratio ~0.18, ~350 MB/s on text)
-  -4              Better   — zstd-12   (ratio ~0.16, ~270 MB/s on text)
+  -1              Fastest  — lz4 fast  (ratio ~0.36, ~430 MB/s on text)
+  -2              Fast     — lz4 HC    (ratio ~0.29, ~340 MB/s on text)
+  -3              Default  — zstd-6    (ratio ~0.18, ~340 MB/s on text)
+  -4              Better   — zstd-12   (ratio ~0.16, ~290 MB/s on text)
   -5              Best     — zstd-18   (ratio ~0.15,  ~60 MB/s on text)
 
 Modes:
@@ -70,7 +69,7 @@ az -v -3 largefile.bin
 # Test integrity without writing output
 az -t archive.az
 
-# Compress with tar (entire directory)
+# Compress/decompress with tar (entire directory)
 tar -cf - ./mydir | az -c > mydir.tar.az
 tar -xf - < <(az -d -c mydir.tar.az)
 ```
@@ -118,11 +117,11 @@ r.Reset(newSrc)
 
 | Level | Algorithm | Compress | Decompress | Ratio |
 |-------|-----------|----------|------------|-------|
-| `-1` fastest | lz4 fast | ~547 MB/s | ~736 MB/s | 0.359 |
-| `-2` fast | lz4 HC | ~289 MB/s | ~736 MB/s | 0.294 |
-| `-3` default | zstd-6 | ~351 MB/s | ~615 MB/s | 0.183 |
-| `-4` better | zstd-12 | ~273 MB/s | ~703 MB/s | 0.162 |
-| `-5` best | zstd-18 | ~59 MB/s | ~703 MB/s | 0.147 |
+| `-1` fastest | lz4 fast | ~430 MB/s | ~860 MB/s | 0.359 |
+| `-2` fast | lz4 HC | ~344 MB/s | ~860 MB/s | 0.294 |
+| `-3` default | zstd-6 | ~344 MB/s | ~737 MB/s | 0.183 |
+| `-4` better | zstd-12 | ~286 MB/s | ~860 MB/s | 0.162 |
+| `-5` best | zstd-18 | ~61 MB/s | ~860 MB/s | 0.147 |
 
 ## Comparison
 
@@ -130,43 +129,41 @@ Measured on Apple M2 Max. Source: `/usr/share/man` tar (51 MB, text).
 
 | Algorithm | Ratio | Compress | Decompress |
 |-----------|-------|----------|------------|
-| **az -1** | 0.359 | 0.09s | 0.07s |
-| **az -2** | 0.294 | 0.17s | 0.07s |
-| **az -3** | 0.183 | 0.14s | 0.07s |
-| **az -4** | 0.162 | 0.18s | 0.07s |
-| **az -5** | 0.147 | 0.83s | 0.07s |
-| lz4 | 0.383 | 0.05s | 0.05s |
-| lz4 -9 | 0.281 | 0.16s | 0.04s |
-| gzip -1 | 0.305 | 0.36s | 0.07s |
-| gzip -6 | 0.250 | 1.09s | 0.07s |
-| gzip -9 | 0.249 | 1.56s | 0.06s |
-| zstd -1 | 0.251 | 0.06s | 0.06s |
-| zstd -3 | 0.208 | 0.07s | 0.06s |
-| zstd -9 | 0.165 | 0.21s | 0.05s |
-| zstd -19 | 0.132 | 6.21s | 0.05s |
-| xz -1 | 0.204 | 0.26s | 0.08s |
-| xz -6 | 0.135 | 6.39s | 0.19s |
+| **az -1** | 0.359 | 0.12s | 0.06s |
+| **az -2** | 0.294 | 0.15s | 0.06s |
+| **az -3** | 0.183 | 0.15s | 0.07s |
+| **az -4** | 0.162 | 0.18s | 0.06s |
+| **az -5** | 0.147 | 0.85s | 0.06s |
+| lz4 -3 | 0.292 | 0.07s | 0.04s |
+| lz4 -6 | 0.282 | 0.11s | 0.04s |
+| zstd -6 | 0.189 | 0.16s | 0.06s |
+| zstd -12 | 0.161 | 0.42s | 0.05s |
+| zstd -18 | 0.134 | 4.01s | 0.05s |
+| gzip -1 | 0.305 | 0.35s | 0.07s |
+| gzip -6 | 0.250 | 1.05s | 0.06s |
+| gzip -9 | 0.249 | 1.51s | 0.06s |
+| xz -1 | 0.204 | 0.25s | 0.07s |
+| xz -6 | 0.135 | 6.25s | 0.18s |
 
-Source: `.compress` tar (123 MB, Go source).
+Source: `az` repo tar (255 MB, Go source).
 
 | Algorithm | Ratio | Compress | Decompress |
 |-----------|-------|----------|------------|
-| **az -1** | 0.946 | 0.23s | 0.07s |
-| **az -2** | 0.942 | 0.09s | 0.07s |
-| **az -3** | 0.860 | 0.12s | 0.07s |
-| **az -4** | 0.828 | 0.21s | 0.06s |
-| **az -5** | 0.814 | 1.65s | 0.07s |
-| lz4 | 0.942 | 0.06s | 0.05s |
-| lz4 -9 | 0.929 | 0.30s | 0.05s |
-| gzip -1 | 0.931 | 1.91s | 0.09s |
-| gzip -6 | 0.928 | 2.29s | 0.09s |
-| gzip -9 | 0.928 | 2.61s | 0.09s |
-| zstd -1 | 0.911 | 0.06s | 0.04s |
-| zstd -3 | 0.859 | 0.08s | 0.05s |
-| zstd -9 | 0.846 | 0.15s | 0.05s |
-| zstd -19 | 0.807 | 7.57s | 0.06s |
-| xz -1 | 0.860 | 2.46s | 0.18s |
-| xz -6 | 0.812 | 7.37s | 0.42s |
+| **az -1** | 0.940 | 0.17s | 0.13s |
+| **az -2** | 0.934 | 0.36s | 0.13s |
+| **az -3** | 0.847 | 0.22s | 0.12s |
+| **az -4** | 0.815 | 0.43s | 0.12s |
+| **az -5** | 0.798 | 3.02s | 0.12s |
+| lz4 -3 | 0.919 | 0.52s | 0.09s |
+| lz4 -6 | 0.918 | 0.57s | 0.09s |
+| zstd -6 | 0.844 | 0.26s | 0.09s |
+| zstd -12 | 0.828 | 0.54s | 0.09s |
+| zstd -18 | 0.791 | 9.59s | 0.10s |
+| gzip -1 | 0.910 | 3.93s | 0.17s |
+| gzip -6 | 0.904 | 5.03s | 0.17s |
+| gzip -9 | 0.904 | 5.80s | 0.17s |
+| xz -1 | 0.842 | 4.74s | 0.32s |
+| xz -6 | 0.792 | 8.90s | 0.55s |
 
 Ratio = compressed / original (lower is better).
 

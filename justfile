@@ -110,15 +110,14 @@ compare target: build
     _bench "az -3"    "$OUT/out.az3"   "$AZ -d -c"    $AZ -c -3
     _bench "az -4"    "$OUT/out.az4"   "$AZ -d -c"    $AZ -c -4
     _bench "az -5"    "$OUT/out.az5"   "$AZ -d -c"    $AZ -c -5
-    _bench "lz4"      "$OUT/out.lz4"   "lz4 -d -c"    lz4 -c
-    _bench "lz4 -9"   "$OUT/out.lz4-9" "lz4 -d -c"    lz4 -9 -c
+    _bench "lz4 -3"   "$OUT/out.lz4-3" "lz4 -d -c"    lz4 -3 -c
+    _bench "lz4 -6"   "$OUT/out.lz4-6" "lz4 -d -c"    lz4 -6 -c
+    _bench "zstd -6"  "$OUT/out.zst6"  "zstd -d -c"   zstd -6 -c
+    _bench "zstd -12" "$OUT/out.zst12" "zstd -d -c"   zstd -12 -c
+    _bench "zstd -18" "$OUT/out.zst18" "zstd -d -c"   zstd -18 -c
     _bench "gzip -1"  "$OUT/out.gz1"   "gzip -d -c"   gzip -1 -c
     _bench "gzip -6"  "$OUT/out.gz6"   "gzip -d -c"   gzip -6 -c
     _bench "gzip -9"  "$OUT/out.gz9"   "gzip -d -c"   gzip -9 -c
-    _bench "zstd -1"  "$OUT/out.zst1"  "zstd -d -c"   zstd -1 -c
-    _bench "zstd -3"  "$OUT/out.zst3"  "zstd -d -c"   zstd -3 -c
-    _bench "zstd -9"  "$OUT/out.zst9"  "zstd -d -c"   zstd -9 -c
-    _bench "zstd -19" "$OUT/out.zst19" "zstd -d -c"   zstd -19 -c
     _bench "xz -1"    "$OUT/out.xz1"   "xz -d -c"     xz -1 -c
     _bench "xz -6"    "$OUT/out.xz6"   "xz -d -c"     xz -6 -c
     echo ""

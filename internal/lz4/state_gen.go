@@ -21,8 +21,9 @@ const _aState_name = "noStateerrorStatenewStatereadStatewriteStateclosedState"
 var _aState_index = [...]uint8{0, 7, 17, 25, 34, 44, 55}
 
 func (i aState) String() string {
-	if i >= aState(len(_aState_index)-1) {
+	idx := int(i) - 0
+	if i < 0 || idx >= len(_aState_index)-1 {
 		return "aState(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
-	return _aState_name[_aState_index[i]:_aState_index[i+1]]
+	return _aState_name[_aState_index[idx]:_aState_index[idx+1]]
 }
