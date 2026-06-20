@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # Full test suite on the three platforms consumers actually use, across the
+  # two most recent Go releases so a regression on either line surfaces.
+  test:
+    name: test
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        go: ['1.25.x', '1.26.x']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+        with:
+          go-version: ${{ matrix.go }}
+      - name: go test ./...
+        run: go test -count=1 -timeout 5m ./...
+
+  # Race-detector pass — linux/amd64 only; the compression logic is
+  # platform-independent Go.
+  race:
+    name: race
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - name: go test -race
+        run: go test -race -count=1 -timeout 10m ./...
+
+  # Static analysis on az's own code (the root package + ./cmd/az). The vendored
+  # internal/ codecs (pierrec/lz4, klauspost/compress) are upstream forks and are
+  # excluded — matches .golangci.yml and the justfile lint recipes.
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - name: go vet
+        # vet runs over the whole module (it's clean on the vendored internal/
+        # trees); the stricter linters below stay scoped to az's own code.
+        run: go vet ./...
+      - name: gofmt -d
+        run: |
+          out=$(gofmt -d $(find . -name '*.go' -not -path './.*/*' -not -path './internal/*'))
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+      - name: staticcheck
+        # Invoke the binary directly rather than the staticcheck action, which
+        # still runs on the deprecated Node.js 20 runtime.
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck . ./cmd/...
+      - name: golangci-lint
+        # v9 of the action defaults to golangci-lint v2.x, which the config
+        # (version: "2") is written against; pin a v2 release explicitly so a
+        # future action revision can't silently downgrade us to v1.
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.4.0
+          args: --timeout 5m
+      - name: gopls modernize
+        # Surfaces Go-version-bump idioms; scoped to az's own packages.
+        # `^go:` strips Go's auto-toolchain breadcrumbs that `go run @latest`
+        # may emit (newer gopls can require a newer Go than go.mod pins).
+        run: |
+          out=$(go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest . ./cmd/... 2>&1 \
+              | grep -v '^exit status' \
+              | grep -v '^go: ' \
+              || true)
+          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+  # Cross-build every GOOS/GOARCH we claim to support (compile-only) so a
+  # platform-specific break in the vendored asm fallbacks surfaces without
+  # needing the test runtime there. Pure Go, so CGO is off.
+  build_all_targets:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin,  goarch: amd64 }
+          - { goos: darwin,  goarch: arm64 }
+          - { goos: freebsd, goarch: amd64 }
+          - { goos: freebsd, goarch: arm64 }
+          - { goos: linux,   goarch: 386 }
+          - { goos: linux,   goarch: amd64 }
+          - { goos: linux,   goarch: arm }
+          - { goos: linux,   goarch: arm64 }
+          - { goos: linux,   goarch: loong64 }
+          - { goos: linux,   goarch: ppc64le }
+          - { goos: linux,   goarch: riscv64 }
+          - { goos: linux,   goarch: s390x }
+          - { goos: windows, goarch: 386 }
+          - { goos: windows, goarch: amd64 }
+          - { goos: windows, goarch: arm64 }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: ./.github/actions/setup
+      - name: cross build
+        env:
+          GOOS:   ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: '0'
+        run: go build ./...

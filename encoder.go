@@ -124,31 +124,101 @@ func (d *Decoder) DecodeAll(dst, src []byte) ([]byte, error) {
 
 	switch binary.LittleEndian.Uint32(src[:4]) {
 	case magicLZ4:
-		if d.br == nil {
-			d.br = bytes.NewReader(src)
-		} else {
-			d.br.Reset(src)
-		}
-		if d.lz4r == nil {
-			d.lz4r = lz4pkg.NewReader(d.br)
-		} else {
-			d.lz4r.Reset(d.br)
-		}
-		return readAllAppend(dst, d.lz4r)
+		return readAllAppend(dst, d.lz4Reader(src))
 
 	case magicZstd:
-		if d.zstdDec == nil {
-			dec, err := zstdpkg.NewReader(nil)
-			if err != nil {
-				return nil, ErrCorrupted
-			}
-			d.zstdDec = dec
+		dec, err := d.zstdDecoder()
+		if err != nil {
+			return nil, err
 		}
-		return d.zstdDec.DecodeAll(src, dst)
+		return dec.DecodeAll(src, dst)
 
 	default:
 		return nil, ErrCorrupted
 	}
+}
+
+// DecodeAllLimit is DecodeAll with a hard ceiling: it decompresses src and
+// appends to dst, but stops and returns ErrTooLarge as soon as the output would
+// exceed max bytes — without allocating materially beyond max. It reuses the
+// Decoder's internal codecs exactly like DecodeAll, so it is suitable for
+// decoding untrusted frames (a decompression-bomb defense) from a pool.
+//
+// For a well-formed frame whose output is ≤ max, the result is identical to
+// DecodeAll(dst, src). For larger output it returns ErrTooLarge having buffered
+// no more than max+1 bytes of output; corrupt frames return the same errors as
+// Reader.
+func (d *Decoder) DecodeAllLimit(dst, src []byte, max int) ([]byte, error) {
+	if len(src) < 4 {
+		return dst, nil
+	}
+
+	switch binary.LittleEndian.Uint32(src[:4]) {
+	case magicLZ4:
+		// The lz4 reader is single-threaded (ConcurrencyOption(1)), so stopping
+		// early can't leak block-decode goroutines.
+		return readLimitAppend(dst, d.lz4Reader(src), max)
+
+	case magicZstd:
+		dec, err := d.zstdDecoder()
+		if err != nil {
+			return nil, err
+		}
+		// Stream block-by-block rather than one-shot DecodeAll, so a bomb is
+		// capped at max+1 output bytes instead of fully materialized. A
+		// *bytes.Reader is not a zstd "byter" (no Bytes method), so Reset streams
+		// instead of synchronously decoding the whole frame.
+		d.resetBR(src)
+		if err := dec.Reset(d.br); err != nil {
+			return nil, ErrCorrupted
+		}
+		out, err := readLimitAppend(dst, dec, max)
+		if err == ErrTooLarge {
+			// We stopped before EOF, so the stream decoder may still be running;
+			// Reset(nil) cancels it and reclaims its block decoders.
+			_ = dec.Reset(nil)
+		}
+		return out, err
+
+	default:
+		return nil, ErrCorrupted
+	}
+}
+
+// resetBR points the reusable bytes.Reader at src.
+func (d *Decoder) resetBR(src []byte) {
+	if d.br == nil {
+		d.br = bytes.NewReader(src)
+	} else {
+		d.br.Reset(src)
+	}
+}
+
+// lz4Reader returns the reusable lz4 reader pointed at src. It is created with
+// ConcurrencyOption(1): single-threaded decode spawns no goroutines (so a
+// bounded decode that stops early can't leak any) and the output bytes are
+// identical regardless of concurrency.
+func (d *Decoder) lz4Reader(src []byte) *lz4pkg.Reader {
+	d.resetBR(src)
+	if d.lz4r == nil {
+		d.lz4r = lz4pkg.NewReader(d.br)
+		_ = d.lz4r.Apply(lz4pkg.ConcurrencyOption(1))
+	} else {
+		d.lz4r.Reset(d.br)
+	}
+	return d.lz4r
+}
+
+// zstdDecoder returns the reusable zstd decoder, creating it lazily.
+func (d *Decoder) zstdDecoder() (*zstdpkg.Decoder, error) {
+	if d.zstdDec == nil {
+		dec, err := zstdpkg.NewReader(nil)
+		if err != nil {
+			return nil, ErrCorrupted
+		}
+		d.zstdDec = dec
+	}
+	return d.zstdDec, nil
 }
 
 // readAllAppend reads everything from r, appending into dst and growing as
@@ -160,6 +230,43 @@ func readAllAppend(dst []byte, r io.Reader) ([]byte, error) {
 		}
 		n, err := r.Read(dst[len(dst):cap(dst)])
 		dst = dst[:len(dst)+n]
+		if err != nil {
+			if err == io.EOF {
+				return dst, nil
+			}
+			return dst, err
+		}
+	}
+}
+
+// readLimitAppend reads from r, appending into dst, but never buffers more than
+// max output bytes: it reads one sentinel byte past max to detect overflow and
+// returns ErrTooLarge (with dst truncated to base+max) the moment the output
+// would exceed max. The backing array never grows beyond base+max+1, so a
+// decompression bomb cannot force a large allocation here.
+func readLimitAppend(dst []byte, r io.Reader, max int) ([]byte, error) {
+	base := len(dst)
+	hardCap := base + max + 1 // room for one byte beyond the allowed max
+	for {
+		end := min(cap(dst), hardCap)
+		if len(dst) == end {
+			// No room left within hardCap; grow, capped at hardCap.
+			newCap := cap(dst) * 2
+			if newCap < base+512 {
+				newCap = base + 512
+			}
+			newCap = min(newCap, hardCap)
+			buf := make([]byte, len(dst), newCap)
+			copy(buf, dst)
+			dst = buf
+			end = min(cap(dst), hardCap)
+		}
+		n, err := r.Read(dst[len(dst):end])
+		dst = dst[:len(dst)+n]
+		if len(dst) == hardCap {
+			// Buffered max+1 output bytes → the output exceeds the limit.
+			return dst[:base+max], ErrTooLarge
+		}
 		if err != nil {
 			if err == io.EOF {
 				return dst, nil

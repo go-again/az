@@ -43,7 +43,6 @@ var lz4Level = map[Level]lz4pkg.CompressionLevel{
 	Level2: lz4pkg.Level3, // HC depth 1024 — moderate compression
 }
 
-
 // zstdLevel maps az levels to zstd EncoderLevel constants.
 var zstdLevel = map[Level]zstdpkg.EncoderLevel{
 	Level3: zstdpkg.SpeedDefault,

@@ -78,11 +78,8 @@ func TestRoundTripStreaming(t *testing.T) {
 		w := NewWriter(&buf, WithLevel(level))
 		// Write in three chunks to exercise multi-block path.
 		chunk := len(data) / 3
-		for i := 0; i < 3; i++ {
-			end := (i + 1) * chunk
-			if end > len(data) {
-				end = len(data)
-			}
+		for i := range 3 {
+			end := min((i+1)*chunk, len(data))
 			if _, err := w.Write(data[i*chunk : end]); err != nil {
 				t.Fatalf("L%d Write chunk %d: %v", level, i, err)
 			}

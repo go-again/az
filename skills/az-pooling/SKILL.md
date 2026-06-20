@@ -25,6 +25,7 @@ func (e *Encoder) EncodeAll(dst, src []byte, level Level) ([]byte, error)
 type Decoder struct{ /* reusable lz4 reader + zstd decoder */ }
 func NewDecoder() *Decoder
 func (d *Decoder) DecodeAll(dst, src []byte) ([]byte, error)
+func (d *Decoder) DecodeAllLimit(dst, src []byte, max int) ([]byte, error)
 ```
 
 Argument order is **`(dst, src)`** (append idiom): the frame is appended to `dst`
@@ -33,7 +34,36 @@ auto-detects lz4 vs zstd, exactly like `Decompress`.
 
 - `EncodeAll(nil, src, lvl)` == `Compress(src, lvl)`, every level/input.
 - `DecodeAll(nil, frame)` == `Decompress(frame)`.
-- Errors: `ErrLevel` (bad level), `ErrCorrupted`/`ErrChecksumFail` (decode).
+- Errors: `ErrLevel` (bad level), `ErrCorrupted`/`ErrChecksumFail` (decode),
+  `ErrTooLarge` (`DecodeAllLimit` only — output exceeds the cap).
+
+## Decoding untrusted frames — `DecodeAllLimit` (bomb defense)
+
+If the frames you decode could be **crafted or corrupt** (untrusted storage, a
+network peer), use `DecodeAllLimit` instead of `DecodeAll`. It is `DecodeAll`
+with a hard ceiling: it streams the decode and returns `ErrTooLarge` the moment
+the output would exceed `max`, **without allocating materially beyond `max`** —
+so a tiny frame that expands to gigabytes cannot exhaust memory.
+
+```go
+d := decPool.Get().(*az.Decoder)
+plain, err := d.DecodeAllLimit(out[:0], frame, maxChunkSize)
+decPool.Put(d)
+if errors.Is(err, az.ErrTooLarge) {
+    return nil, errors.New("frame exceeds chunk size (corrupt or hostile data)")
+}
+if err != nil {
+    return nil, err // ErrCorrupted / ErrChecksumFail
+}
+```
+
+- For a well-formed frame whose output is ≤ `max`, the result is identical to
+  `DecodeAll(dst, src)`.
+- It reuses the same pooled codecs as `DecodeAll` — so you keep the pooling win
+  *and* the bound. (This is why you don't fall back to a fresh `az.Reader` +
+  `io.LimitReader` per call.)
+- `ErrTooLarge` is distinct from `ErrCorrupted` so you can tell a bomb from a
+  malformed frame if you care to.
 
 ## Concurrency contract — pool one per goroutine
 

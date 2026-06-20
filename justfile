@@ -4,23 +4,45 @@
 az_bin := "./az"
 tmp_dir := "/tmp/az-bench"
 
+# Packages az authors and lints. Everything under internal/ is vendored upstream
+# (pierrec/lz4, klauspost/compress) and is built + tested but never linted —
+# matches the `internal/` exclusion in .golangci.yml.
+gopkgs := ". ./cmd/..."
+
+# Default recipe: a fast pre-commit gate (mirrors gosqlite.org).
+default: build test lint
+
+# List every recipe (just --list shorthand).
+help:
+    @just --list
+
 # ── Development ───────────────────────────────────────────────────────────────
 
 # Build the az CLI binary
 build:
     go build -trimpath -ldflags '-s -w' -o {{ az_bin }} ./cmd/az
 
-# Run all tests
+# Run the full test suite (all packages, incl. vendored internal/).
 test:
-    go test ./...
+    go test -count=1 -timeout 5m ./...
 
-# Run tests with verbose output
+# Verbose test run for diagnosing a flake.
 test-v:
-    go test -v ./...
+    go test -count=1 -timeout 5m -v ./...
 
-# Run tests with race detector
+# Run a single named test (or regex). Usage: just test-one TestEncodeAll
+test-one PATTERN:
+    go test -count=1 -timeout 2m -run "{{ PATTERN }}" -v ./...
+
+# Run tests with the race detector.
 test-race:
-    go test -race ./...
+    go test -race -count=1 -timeout 10m ./...
+
+# Test with coverage; outputs HTML to /tmp/cover.html.
+coverage:
+    go test -count=1 -coverprofile=/tmp/cover.out ./...
+    go tool cover -html=/tmp/cover.out -o /tmp/cover.html
+    @echo "open /tmp/cover.html"
 
 # Run short fuzz test (30 s)
 fuzz:
@@ -29,6 +51,60 @@ fuzz:
 # Run long fuzz test (10 min)
 fuzz-long:
     go test -fuzz=FuzzRoundtrip -fuzztime=10m
+
+# ── Linting ────────────────────────────────────────────────────────────────────
+#
+# Lint az's own code (gopkgs); vendored internal/ is excluded everywhere. Order
+# is cheapest-first; fmt-check leads because it's the most common CI failure from
+# local-only pushes.
+
+# Full lint pass (matches CI): fmt-check + vet + staticcheck + golangci + modernize.
+lint: fmt-check vet staticcheck golangci modernize
+
+# gofmt diff (read-only). Fails if any file would be reformatted.
+fmt-check:
+    @out=$(gofmt -d $(find . -name '*.go' -not -path './.*/*' -not -path './internal/*')); \
+    if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+# Apply gofmt in place.
+fmt:
+    @gofmt -w $(find . -name '*.go' -not -path './.*/*' -not -path './internal/*')
+
+# go vet over the whole module. vet is clean on the vendored internal/ trees, so
+# unlike the stricter linters it costs nothing to run there and gives the
+# vendored codecs at least vet coverage.
+vet:
+    go vet ./...
+
+# staticcheck. Install: go install honnef.co/go/tools/cmd/staticcheck@latest
+staticcheck:
+    @if ! command -v staticcheck >/dev/null; then \
+        echo "staticcheck not installed; go install honnef.co/go/tools/cmd/staticcheck@latest"; \
+        exit 1; \
+    fi
+    staticcheck {{ gopkgs }}
+
+# golangci-lint. Install: brew install golangci-lint (or see https://golangci-lint.run).
+golangci:
+    @if ! command -v golangci-lint >/dev/null; then \
+        echo "golangci-lint not installed; see https://golangci-lint.run"; \
+        exit 1; \
+    fi
+    golangci-lint run --timeout 5m
+
+# gopls modernize: flags Go-version-bump idioms (range-over-int, slices/maps,
+# strings.SplitSeq, etc.). Run via `go run` so no separate install is needed.
+# `^go:` strips the auto-toolchain breadcrumbs `go run @latest` may emit.
+modernize:
+    @out=$(go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest {{ gopkgs }} 2>&1 \
+        | grep -v '^exit status' \
+        | grep -v '^go: ' \
+        || true); \
+    if [ -n "$out" ]; then echo "$out"; exit 1; fi
+
+# go mod tidy.
+tidy:
+    go mod tidy
 
 # Run Go benchmarks (all levels × corpus)
 bench:

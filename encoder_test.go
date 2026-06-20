@@ -2,6 +2,8 @@ package az
 
 import (
 	"bytes"
+	"errors"
+	"runtime"
 	"testing"
 )
 
@@ -108,7 +110,7 @@ func TestEncoderReuseNoStateBleed(t *testing.T) {
 		makePatterned(1 << 16),
 		[]byte("hello world"),
 	}
-	for round := 0; round < 3; round++ {
+	for round := range 3 {
 		for i, in := range inputs {
 			for _, level := range allLevels() {
 				frame, err := enc.EncodeAll(nil, in, level)
@@ -212,5 +214,120 @@ func TestDecodeAllCorrupted(t *testing.T) {
 		if err != nil || len(got) != 0 {
 			t.Fatalf("short input %v: want (empty,nil), got (%d bytes, %v)", short, len(got), err)
 		}
+	}
+}
+
+// ─── DecodeAllLimit (bounded decode) ─────────────────────────────────────────────
+
+// Bounded round-trip: when the output fits the limit, DecodeAllLimit equals
+// DecodeAll across all levels and inputs, at the exact boundary and with slack.
+func TestDecodeAllLimitRoundTrip(t *testing.T) {
+	dec := NewDecoder()
+	for _, tc := range testCases {
+		for _, level := range levelsFor(tc.data) {
+			tc, level := tc, level
+			t.Run(tc.name+"/L"+string(rune('0'+level)), func(t *testing.T) {
+				frame, err := Compress(tc.data, level)
+				if err != nil {
+					t.Fatalf("Compress: %v", err)
+				}
+				// max == output (exact boundary) and max with slack both succeed.
+				for _, max := range []int{len(tc.data), len(tc.data) + 4096} {
+					got, err := dec.DecodeAllLimit(nil, frame, max)
+					if err != nil {
+						t.Fatalf("DecodeAllLimit(max=%d): %v", max, err)
+					}
+					if !bytes.Equal(tc.data, got) {
+						t.Fatalf("max=%d: mismatch: input %d bytes, got %d", max, len(tc.data), len(got))
+					}
+				}
+			})
+		}
+	}
+}
+
+// One byte under the true size must be rejected, at every level.
+func TestDecodeAllLimitRejectsOversized(t *testing.T) {
+	dec := NewDecoder()
+	data := makePatterned(40000)
+	for _, level := range allLevels() {
+		frame, err := Compress(data, level)
+		if err != nil {
+			t.Fatalf("Compress: %v", err)
+		}
+		got, err := dec.DecodeAllLimit(nil, frame, len(data)-1)
+		if !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("L%d: want ErrTooLarge, got %v", level, err)
+		}
+		if len(got) > len(data)-1 {
+			t.Fatalf("L%d: returned %d bytes, exceeds max %d", level, len(got), len(data)-1)
+		}
+	}
+}
+
+// A bomb (tiny frame, huge output) is rejected without materializing the full
+// output: the returned buffer's capacity stays bounded by ~max regardless of the
+// 64 MiB the frame expands to.
+func TestDecodeAllLimitBombBoundedAllocation(t *testing.T) {
+	const bombSize = 64 << 20 // 64 MiB of zeros → a few hundred bytes compressed
+	const max = 1 << 20       // 1 MiB ceiling
+	dec := NewDecoder()
+	for _, level := range []Level{Level1, Level3} { // one lz4, one zstd
+		frame, err := Compress(make([]byte, bombSize), level)
+		if err != nil {
+			t.Fatalf("Compress: %v", err)
+		}
+		if len(frame) > max {
+			t.Fatalf("L%d: bomb frame unexpectedly large (%d bytes)", level, len(frame))
+		}
+		got, err := dec.DecodeAllLimit(nil, frame, max)
+		if !errors.Is(err, ErrTooLarge) {
+			t.Fatalf("L%d: want ErrTooLarge, got %v", level, err)
+		}
+		if cap(got) > max+4096 {
+			t.Fatalf("L%d: output buffer ballooned to cap %d (max %d) — bomb not bounded", level, cap(got), max)
+		}
+	}
+}
+
+// Decodes interleaved across lz4- and zstd-format inputs through one Decoder
+// yield correct, independent results — and a bounded decode that stops early
+// must not leak a stream goroutine.
+func TestDecodeAllLimitReuseAndNoGoroutineLeak(t *testing.T) {
+	dec := NewDecoder()
+	small := makePatterned(20000)
+	bomb := make([]byte, 32<<20)
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	for round := range 50 {
+		for _, level := range allLevels() { // L1-2 lz4, L3-5 zstd
+			// Successful bounded decode.
+			frame, err := Compress(small, level)
+			if err != nil {
+				t.Fatalf("Compress: %v", err)
+			}
+			got, err := dec.DecodeAllLimit(nil, frame, len(small))
+			if err != nil || !bytes.Equal(small, got) {
+				t.Fatalf("round %d L%d: bounded decode failed: err=%v", round, level, err)
+			}
+			// Early-stop decode (forces stream cancellation on the zstd path).
+			bframe, err := Compress(bomb, level)
+			if err != nil {
+				t.Fatalf("Compress bomb: %v", err)
+			}
+			if _, err := dec.DecodeAllLimit(nil, bframe, 4096); !errors.Is(err, ErrTooLarge) {
+				t.Fatalf("round %d L%d: want ErrTooLarge, got %v", round, level, err)
+			}
+		}
+	}
+
+	runtime.GC()
+	after := runtime.NumGoroutine()
+	// Allow a little slack for runtime/background goroutines; a per-call leak
+	// over 50 rounds × 5 levels would be ~250.
+	if after > before+5 {
+		t.Fatalf("goroutine leak: before=%d after=%d", before, after)
 	}
 }

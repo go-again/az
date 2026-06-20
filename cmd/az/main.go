@@ -46,10 +46,10 @@ func main() {
 func run() int {
 	// ── Flag parsing ──────────────────────────────────────────────────────────
 	var (
-		level1, level2, level3, level4, level5              bool
-		decompress, keep, stdout, force, test, verbose      bool
-		noChecksum                                          bool
-		outputFile                                          string
+		level1, level2, level3, level4, level5         bool
+		decompress, keep, stdout, force, test, verbose bool
+		noChecksum                                     bool
+		outputFile                                     string
 	)
 	flag.BoolVar(&level1, "1", false, "fastest (lz4 level 3)")
 	flag.BoolVar(&level2, "2", false, "fast (lz4 level 6)")
@@ -268,7 +268,7 @@ func (rc *renameCloser) Close() error {
 	if err := rc.File.Close(); err != nil {
 		return err
 	}
-	return os.Rename(rc.File.Name(), rc.dst)
+	return os.Rename(rc.Name(), rc.dst)
 }
 
 // countWriter counts bytes written through it.

@@ -42,13 +42,27 @@ from the frame magic, so `.az` files are plain lz4 or zstd streams that standard
 Use `just` (recipes in `justfile`):
 
 ```sh
+just                # default gate: build + test + lint
 just build          # build ./cmd/az → ./az
-just test           # go test ./...
-just test-race      # go test -race ./...
+just test           # go test -count=1 -timeout 5m ./...
+just test-race      # race detector
+just lint           # fmt-check + vet + staticcheck + golangci + modernize
+just fmt            # gofmt -w (apply)
 just fuzz           # 30s fuzz of FuzzRoundtrip
 just bench          # go test -bench=. -benchmem -benchtime=3s ./...
 just compare <dir>  # size/speed table vs lz4/zstd/gzip/xz (needs those CLIs)
 ```
+
+**Lint scope:** `go vet` runs over the whole module (`./...`) — it's clean on the
+vendored `internal/` trees, so they get vet coverage for free. The stricter
+linters (`staticcheck`/`golangci`/`modernize`) run only over az's own packages
+(`. ./cmd/...`); the vendored `internal/` forks would otherwise flag ~19 upstream
+idioms (`SA4004`/`U1000`/…) that aren't bugs and shouldn't drift from upstream
+(see `.golangci.yml`). `gofmt` covers everything except `internal/` and dot-dirs. `staticcheck` and `golangci-lint` need to be installed
+(`go install honnef.co/go/tools/cmd/staticcheck@latest`; `brew install
+golangci-lint` — the config targets golangci-lint **v2**). CI (`.github/workflows/ci.yml`,
+modeled on gosqlite.org) runs test (ubuntu/macos/windows × Go 1.25/1.26), race,
+the same lint gate, and a cross-build matrix.
 
 Plain `go build ./...` / `go test ./...` also work. Note: first compile of the
 vendored zstd/lz4/fse packages is slow (tens of seconds) — be patient and
@@ -90,19 +104,30 @@ should match) and the identity tests must stay green.
   `Writer` enables block checksums and omits `SizeOption`; `Reader.Reset`
   discards its sub-decoder. Use `Compress`/`Encoder` when at-rest identity
   matters, `Writer`/`Reader` for general streaming.
+- **`DecodeAllLimit` must stream, never one-shot.** The bound is what makes it
+  safe on untrusted frames, so it drives the per-format reader and caps `dst`
+  growth at `max+1` (`readLimitAppend`). Two traps if you touch it: (1) the zstd
+  `Decoder.Reset` *synchronously decodes the whole frame* when handed a `byter`
+  (`Bytes()`+`Len()`) under ~128 KiB — `*bytes.Reader` lacks `Bytes()` so it
+  streams, but don't "helpfully" switch to `*bytes.Buffer`/raw bytes or you
+  re-arm the bomb; (2) on early stop (`ErrTooLarge`) the zstd stream goroutine is
+  still running — `Reset(nil)` cancels it. The Decoder's lz4 reader is
+  `ConcurrencyOption(1)` precisely so the lz4 path has no goroutine to leak on
+  early stop. There's a goroutine-leak regression test for this.
 
 ## Public API contract (don't break)
 
 `Compress`, `Decompress`, `Writer`/`NewWriter`, `Reader`/`NewReader`,
-`Encoder`/`NewEncoder`/`EncodeAll`, `Decoder`/`NewDecoder`/`DecodeAll`, the
-`Level` constants, `With*` options, and the three sentinel errors are the public
+`Encoder`/`NewEncoder`/`EncodeAll`, `Decoder`/`NewDecoder`/`DecodeAll`/`DecodeAllLimit`,
+the `Level` constants, `With*` options, and the sentinel errors
+(`ErrCorrupted`, `ErrChecksumFail`, `ErrLevel`, `ErrTooLarge`) are the public
 surface. Keep additions **additive**; the levels' on-disk format is a
 compatibility boundary.
 
 ## Before you finish
 
-- `just test` (and `just test-race` for concurrency-touching changes) green.
-- `go vet ./...` clean.
+- `just lint` and `just test` (and `just test-race` for concurrency-touching
+  changes) green — this is the same gate CI enforces.
 - If you changed level configs, codec options, or the wire path, re-run the
   format-identity tests and update the README levels/wire-format sections.
 - Store a pantry note and update `~/.claude` memory for non-obvious decisions

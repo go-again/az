@@ -110,6 +110,11 @@ enc := az.NewEncoder()
 frame, err := enc.EncodeAll(dst[:0], data, az.Level3) // appends into dst
 dec := az.NewDecoder()
 plain, err := dec.DecodeAll(out[:0], frame)           // auto-detects lz4/zstd
+
+// Bounded decode for untrusted frames (decompression-bomb defense): stops with
+// az.ErrTooLarge once output would exceed max, without allocating beyond it.
+plain, err = dec.DecodeAllLimit(out[:0], frame, maxBytes)
+if errors.Is(err, az.ErrTooLarge) { /* reject: frame too large / corrupt */ }
 ```
 
 An `Encoder`/`Decoder` is **not** safe for concurrent use; pool one per
