@@ -14,7 +14,7 @@ go install github.com/go-again/az/cmd/az@latest
 Or build from source:
 
 ```sh
-git clone <repo>
+git clone https://github.com/go-again/az.git
 cd az
 go build -o az ./cmd/az
 ```
@@ -101,6 +101,26 @@ r.Close()
 // Reset for reuse (avoids re-allocation)
 w.Reset(newDst)
 r.Reset(newSrc)
+
+// Poolable one-shot codecs — reuse heavy lz4/zstd objects across many
+// independent buffers (e.g. one per pooled worker). EncodeAll output is
+// byte-identical to Compress; DecodeAll output equals Decompress, so the
+// at-rest format is unchanged.
+enc := az.NewEncoder()
+frame, err := enc.EncodeAll(dst[:0], data, az.Level3) // appends into dst
+dec := az.NewDecoder()
+plain, err := dec.DecodeAll(out[:0], frame)           // auto-detects lz4/zstd
+```
+
+An `Encoder`/`Decoder` is **not** safe for concurrent use; pool one per
+goroutine:
+
+```go
+var encPool = sync.Pool{New: func() any { return az.NewEncoder() }}
+
+e := encPool.Get().(*az.Encoder)
+frame, err := e.EncodeAll(scratch[:0], data, az.Level3)
+encPool.Put(e)
 ```
 
 ### Options

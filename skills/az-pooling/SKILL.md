@@ -1,0 +1,98 @@
+---
+name: az-pooling
+description: High-throughput compression with github.com/go-again/az using pooled Encoder/Decoder (EncodeAll/DecodeAll) to reuse heavy lz4/zstd codecs across many calls and cut GC/alloc churn. Use when compressing or decompressing many independent buffers/chunks/messages at high frequency or concurrency (e.g. per-row, per-chunk, per-request, per-RPC). For one-off or streaming compression, use the az-integration skill instead.
+---
+
+# High-throughput `az` with pooled Encoder/Decoder
+
+When you compress **many independent buffers** (DB chunks, cache entries, RPC
+payloads), calling `az.Compress`/`az.Decompress` per buffer constructs a fresh,
+heavyweight codec each time — the zstd encoder/decoder objects especially cause
+real GC pressure and CPU cost. `az.Encoder`/`az.Decoder` reuse those heavy
+objects across calls.
+
+**The output is byte-identical to `Compress`/`Decompress`**, so a store can mix
+chunks written the old way with chunks written via the pool and round-trip both —
+no migration, no at-rest format change.
+
+## API
+
+```go
+type Encoder struct{ /* reusable lz4 writer + per-level zstd encoders */ }
+func NewEncoder() *Encoder
+func (e *Encoder) EncodeAll(dst, src []byte, level Level) ([]byte, error)
+
+type Decoder struct{ /* reusable lz4 reader + zstd decoder */ }
+func NewDecoder() *Decoder
+func (d *Decoder) DecodeAll(dst, src []byte) ([]byte, error)
+```
+
+Argument order is **`(dst, src)`** (append idiom): the frame is appended to `dst`
+and the extended slice is returned; a `nil` dst allocates. `DecodeAll`
+auto-detects lz4 vs zstd, exactly like `Decompress`.
+
+- `EncodeAll(nil, src, lvl)` == `Compress(src, lvl)`, every level/input.
+- `DecodeAll(nil, frame)` == `Decompress(frame)`.
+- Errors: `ErrLevel` (bad level), `ErrCorrupted`/`ErrChecksumFail` (decode).
+
+## Concurrency contract — pool one per goroutine
+
+**An `Encoder`/`Decoder` is NOT safe for concurrent use.** Put them in a
+`sync.Pool` and Get/Put around each operation:
+
+```go
+var (
+    encPool = sync.Pool{New: func() any { return az.NewEncoder() }}
+    decPool = sync.Pool{New: func() any { return az.NewDecoder() }}
+)
+
+func encodeChunk(dst, plain []byte, lvl az.Level) ([]byte, error) {
+    e := encPool.Get().(*az.Encoder)
+    defer encPool.Put(e)
+    return e.EncodeAll(dst, plain, lvl) // dst can be a pooled scratch slice
+}
+
+func decodeChunk(dst, comp []byte) ([]byte, error) {
+    d := decPool.Get().(*az.Decoder)
+    defer decPool.Put(d)
+    return d.DecodeAll(dst, comp)
+}
+```
+
+Pair this with a pooled `dst` scratch buffer (e.g. `buf[:0]`) to also reuse the
+output backing array. Copy the result out before returning the scratch to its
+pool — the next `EncodeAll` will overwrite it.
+
+## Why this is the right model for concurrent chunk workloads
+
+Parallelism comes from running **many chunks across goroutines**, each with its
+own pooled encoder — not from splitting a single chunk internally. So a
+per-goroutine encoder is exactly what you want, and it avoids CPU
+oversubscription you'd get if each call also spun up its own worker goroutines.
+
+## Performance note (lz4 levels 1–2 only)
+
+The pooled `Encoder` runs the lz4 path single-threaded (a deliberate, correct
+choice — the concurrent lz4 writer can't be safely reused). Effects:
+
+- Inputs ≤ 4 MB (one lz4 block): **no difference** vs `Compress`.
+- Inputs > 4 MB at L1/L2: `EncodeAll` loses intra-call block parallelism, so a
+  single large call is modestly slower in wall-clock than `Compress` — but uses
+  far less memory and far fewer allocs, and under cross-goroutine concurrency the
+  aggregate throughput is what matters.
+- **zstd levels (3–5):** purely faster *and* lighter than `Compress` — this is
+  where the big GC/alloc win lands. Typical: ~20× less B/op and ~3× fewer
+  allocs/op, plus lower latency.
+
+If you compress chunks that are both large (>4 MB) *and* lz4-level *and* latency
+of a single call dominates, prefer `az.Compress` for those; otherwise the pool is
+the better default.
+
+## Checklist
+
+- [ ] Many independent buffers at high frequency/concurrency? → use this.
+- [ ] One `sync.Pool` for `Encoder`, one for `Decoder`; Get/Put per call.
+- [ ] Never share an `Encoder`/`Decoder` across goroutines concurrently.
+- [ ] Reuse a `dst` scratch slice; copy the result out before reusing it.
+- [ ] Rely on byte-identity: no migration needed when switching existing code
+      from `Compress`/`Decompress` to `EncodeAll`/`DecodeAll`.

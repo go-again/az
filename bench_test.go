@@ -48,6 +48,70 @@ func BenchmarkDecompress(b *testing.B) {
 	}
 }
 
+// BenchmarkEncodeAll exercises the pooled Encoder, reusing one instance and a
+// scratch dst across iterations — the intended high-throughput usage. Compare
+// against BenchmarkCompress to see the drop in allocs/op and B/op, especially on
+// the zstd levels (L3–L5).
+func BenchmarkEncodeAll(b *testing.B) {
+	for _, c := range benchCorpora {
+		data := c.data()
+		for _, level := range []Level{Level1, Level2, Level3, Level4, Level5} {
+			name := fmt.Sprintf("%s/L%d", c.name, level)
+			b.Run(name, func(b *testing.B) {
+				enc := NewEncoder()
+				var scratch []byte
+				b.SetBytes(int64(len(data)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					scratch, _ = enc.EncodeAll(scratch[:0], data, level)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkCompressOneShot is the per-call baseline (fresh codec each call) for
+// the zstd levels, to contrast with BenchmarkEncodeAll's pooled reuse.
+func BenchmarkCompressOneShot(b *testing.B) {
+	for _, c := range benchCorpora {
+		data := c.data()
+		for _, level := range []Level{Level1, Level2, Level3, Level4, Level5} {
+			name := fmt.Sprintf("%s/L%d", c.name, level)
+			b.Run(name, func(b *testing.B) {
+				b.SetBytes(int64(len(data)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					_, _ = Compress(data, level)
+				}
+			})
+		}
+	}
+}
+
+// BenchmarkDecodeAll exercises the pooled Decoder, reusing one instance and a
+// scratch dst across iterations.
+func BenchmarkDecodeAll(b *testing.B) {
+	for _, c := range benchCorpora {
+		data := c.data()
+		for _, level := range []Level{Level1, Level2, Level3, Level4, Level5} {
+			comp, _ := Compress(data, level)
+			name := fmt.Sprintf("%s/L%d", c.name, level)
+			b.Run(name, func(b *testing.B) {
+				dec := NewDecoder()
+				var scratch []byte
+				b.SetBytes(int64(len(data)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					scratch, _ = dec.DecodeAll(scratch[:0], comp)
+				}
+			})
+		}
+	}
+}
+
 func BenchmarkCompressRatio(b *testing.B) {
 	for _, c := range benchCorpora {
 		data := c.data()
