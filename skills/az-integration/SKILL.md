@@ -1,6 +1,6 @@
 ---
 name: az-integration
-description: Integrate the github.com/go-again/az compression library into a Go project — one-shot Compress/Decompress, streaming Writer/Reader, level selection (1–5), error handling, and lz4/zstd wire-format compatibility. Use when adding or wiring az-based compression into Go code. For high-throughput per-chunk/per-request compression with object pooling, use the az-pooling skill instead.
+description: Integrate the github.com/go-again/az compression library into a Go project — one-shot Compress/Decompress, streaming Writer/Reader, level selection (1–5), HTTP response/request compression via azhttp, error handling, and lz4/zstd wire-format compatibility. Use when adding or wiring az-based compression into Go code, including HTTP middleware. For high-throughput per-chunk/per-request compression with object pooling, use the az-pooling skill instead.
 ---
 
 # Integrating `az` (github.com/go-again/az)
@@ -69,10 +69,30 @@ re-allocating.
 ## Options
 
 ```go
-az.WithLevel(az.Level3)   // default Level3
-az.WithChecksum(false)    // default true; disable to shave a little CPU/size
-az.WithContentSize(true)  // default false; embed uncompressed size (one-shot only)
+az.WithLevel(az.Level3)    // default Level3
+az.WithChecksum(false)     // default true; disable to shave a little CPU/size
+az.WithConcurrency(1)      // default GOMAXPROCS; use 1 for one Writer per request/job
+az.WithContentSize(true)   // no-op; one-shot frames always embed the uncompressed size
 ```
+
+`Writer.Flush()` pushes buffered input downstream without ending the stream —
+use it when a reader is waiting (streamed responses), not on every write.
+
+## HTTP (`github.com/go-again/az/azhttp`)
+
+Don't hand-roll compression into an `http.Handler` — the subpackage does it:
+
+```go
+http.ListenAndServe(":8080", azhttp.Handler(mux))                 // server
+client := &http.Client{Transport: azhttp.Transport(nil)}          // client
+http.Handle("/upload", azhttp.DecompressRequests(8<<20)(handler)) // uploads
+```
+
+Levels 3–5 go out as the standard **`zstd`** content coding; levels 1–2 as
+**`lz4`**, which is non-standard and only ever sent to a client that named it in
+`Accept-Encoding`. Negotiation, `Vary`, `MinSize`, content-type filtering, ETag
+handling and streaming `Flush` are all handled. **See the `az-http` skill** for
+options and the full contract.
 
 ## Errors
 
@@ -91,6 +111,11 @@ Match with `errors.Is`.
 - Levels 1–2 emit LZ4 frames (magic `0x184D2204`); levels 3–5 emit Zstd frames
   (magic `0xFD2FB528`). External tools work: `lz4 -d file.az` (L1–2),
   `zstd -d file.az` (L3–5).
+- `Compress`/`EncodeAll` always record the uncompressed size in the frame header
+  (zstd `Frame_Content_Size` / lz4 `Content_Size`), for every input size. A
+  consumer can size its output buffer from the header alone — e.g.
+  `ZSTD_getFrameContentSize` → allocate → `ZSTD_decompress` in one shot. The
+  streaming `Writer` cannot know the size up front, so its frames omit it.
 
 ## Quick checklist
 

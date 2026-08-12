@@ -53,30 +53,35 @@ jobs:
         run: |
           out=$(gofmt -d $(find . -name '*.go' -not -path './.*/*' -not -path './internal/*'))
           if [ -n "$out" ]; then echo "$out"; exit 1; fi
+      # Tool versions below are pinned to the same ones the justfile runs, so a
+      # green `just lint` locally means a green lint job here. Bump both together.
       - name: staticcheck
-        # Invoke the binary directly rather than the staticcheck action, which
+        # `go run` a pinned version rather than the staticcheck action, which
         # still runs on the deprecated Node.js 20 runtime.
-        run: |
-          go install honnef.co/go/tools/cmd/staticcheck@latest
-          staticcheck . ./cmd/...
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 . ./azhttp/... ./cmd/... ./examples/...
       - name: golangci-lint
         # v9 of the action defaults to golangci-lint v2.x, which the config
         # (version: "2") is written against; pin a v2 release explicitly so a
         # future action revision can't silently downgrade us to v1.
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.4.0
+          version: v2.12.2
           args: --timeout 5m
       - name: gopls modernize
-        # Surfaces Go-version-bump idioms; scoped to az's own packages.
-        # `^go:` strips Go's auto-toolchain breadcrumbs that `go run @latest`
-        # may emit (newer gopls can require a newer Go than go.mod pins).
+        # Surfaces Go-version-bump idioms (min/max, range-over-int, WaitGroup.Go,
+        # …); scoped to az's own packages. Exits non-zero when it finds any.
+        run: go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 . ./azhttp/... ./cmd/... ./examples/...
+      - name: go.mod tidy
         run: |
-          out=$(go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@latest . ./cmd/... 2>&1 \
-              | grep -v '^exit status' \
-              | grep -v '^go: ' \
-              || true)
-          if [ -n "$out" ]; then echo "$out"; exit 1; fi
+          cp go.mod go.mod.bak
+          go mod tidy
+          cmp -s go.mod go.mod.bak || { echo "go.mod not tidy — run: just tidy"; exit 1; }
+      - name: no external dependencies
+        # az is dependency-free by design (the codecs are vendored under
+        # internal/); a stray `go get` must not slip past review.
+        run: |
+          extra=$(go list -m all | grep -v '^github.com/go-again/az$' || true)
+          if [ -n "$extra" ]; then echo "unexpected dependencies:"; echo "$extra"; exit 1; fi
 
   # Cross-build every GOOS/GOARCH we claim to support (compile-only) so a
   # platform-specific break in the vendored asm fallbacks surfaces without

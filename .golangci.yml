@@ -1,8 +1,8 @@
 # golangci-lint config for az. Modeled on gosqlite.org's config.
 #
 # Scope: az's own code is the root package (az.go, encoder.go, options.go,
-# errors.go) and ./cmd/az. Everything under internal/ is vendored upstream
-# (pierrec/lz4 → internal/lz4; klauspost/compress → internal/zstd, fse, huff0,
+# errors.go), ./azhttp, ./cmd/az and ./examples. Everything under internal/ is
+# vendored upstream (pierrec/lz4 → internal/lz4; klauspost/compress → internal/zstd, fse, huff0,
 # le, cpuinfo, compress; the fuzz helper). We do not lint vendored code — it
 # follows upstream style and shouldn't drift on our linters. Dot-prefixed
 # reference clones (.compress/, .lz4/) and .plans/ are git-ignored and never

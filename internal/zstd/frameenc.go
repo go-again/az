@@ -13,11 +13,16 @@ import (
 )
 
 type frameHeader struct {
-	ContentSize   uint64
-	WindowSize    uint32
-	SingleSegment bool
-	Checksum      bool
-	DictID        uint32
+	ContentSize uint64
+	WindowSize  uint32
+	// ContentSizeKnown forces Frame_Content_Size to be written even when the
+	// size is too small for the compact encodings to express (see appendTo).
+	// az fork: az always records the size for one-shot frames so decoders can
+	// size their output buffer from the header alone.
+	ContentSizeKnown bool
+	SingleSegment    bool
+	Checksum         bool
+	DictID           uint32
 }
 
 const maxHeaderSize = 14
@@ -58,6 +63,13 @@ func (f frameHeader) appendTo(dst []byte) []byte {
 	}
 	if f.ContentSize >= 0xffffffff {
 		fcs++
+	}
+	if f.ContentSizeKnown && fcs == 0 && !f.SingleSegment {
+		// FCS_Field_Size 0 means "absent" unless Single_Segment_Flag is set, and
+		// FCS_Field_Size 1 (2 bytes) is biased by 256 so it cannot express a
+		// size < 256. Widen to the 4-byte field so a windowed frame can still
+		// carry a known small size (RFC 8878 §3.1.1.1.1).
+		fcs = 2
 	}
 
 	fhd |= fcs << 6

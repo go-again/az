@@ -1,6 +1,6 @@
 ---
 name: az-pooling
-description: High-throughput compression with github.com/go-again/az using pooled Encoder/Decoder (EncodeAll/DecodeAll) to reuse heavy lz4/zstd codecs across many calls and cut GC/alloc churn. Use when compressing or decompressing many independent buffers/chunks/messages at high frequency or concurrency (e.g. per-row, per-chunk, per-request, per-RPC). For one-off or streaming compression, use the az-integration skill instead.
+description: High-throughput compression with github.com/go-again/az using pooled Encoder/Decoder (EncodeAll/DecodeAll) to reuse heavy lz4/zstd codecs across many calls and cut GC/alloc churn, plus pooling a streaming Writer with WithConcurrency(1). Use when compressing or decompressing many independent buffers/chunks/messages at high frequency or concurrency (e.g. per-row, per-chunk, per-request, per-RPC), or when reusing a streaming Writer per request. For one-off compression, use the az-integration skill; for HTTP traffic, use az-http.
 ---
 
 # High-throughput `az` with pooled Encoder/Decoder
@@ -93,6 +93,50 @@ Pair this with a pooled `dst` scratch buffer (e.g. `buf[:0]`) to also reuse the
 output backing array. Copy the result out before returning the scratch to its
 pool — the next `EncodeAll` will overwrite it.
 
+## Pooling a streaming `Writer` (per-request/per-stream output)
+
+`Encoder`/`Decoder` are for whole buffers. When the output is a *stream* you
+compress as it is produced — an HTTP response, an export, a log shipper — pool
+`az.Writer` instead, and create it with **`az.WithConcurrency(1)`**:
+
+```go
+var writerPool = sync.Pool{}
+
+func getWriter(dst io.Writer) *az.Writer {
+    if w, ok := writerPool.Get().(*az.Writer); ok {
+        w.Reset(dst)
+        return w
+    }
+    return az.NewWriter(dst, az.WithLevel(az.Level3), az.WithConcurrency(1))
+}
+
+func putWriter(w *az.Writer) {
+    w.Reset(io.Discard) // don't let a pooled writer pin the finished stream
+    writerPool.Put(w)
+}
+
+w := getWriter(dst)
+defer putWriter(w)        // after Close
+_, err := io.Copy(w, src)
+err = w.Close()           // mandatory: writes the end-of-stream marker
+```
+
+Why concurrency 1 is not optional here:
+
+- **Reuse correctness.** Only a single-threaded lz4 writer can be `Reset` and
+  reused after `Close`; the concurrent one deadlocks. Levels 3–5 tolerate either,
+  but one rule for both levels is simpler and always right.
+- **Footprint.** The default is `GOMAXPROCS` workers *per writer*. If the work is
+  already parallel (one writer per request), that multiplies goroutines and codec
+  memory by the core count for no throughput gain.
+
+Concurrency does not change the bytes produced, only how they are produced.
+`w.Flush()` pushes what's buffered without ending the stream — use it only when
+a reader is actually waiting, since each flush costs ratio.
+
+For HTTP specifically, don't build this yourself: `github.com/go-again/az/azhttp`
+is exactly this, plus `Accept-Encoding` negotiation — see the **az-http** skill.
+
 ## Why this is the right model for concurrent chunk workloads
 
 Parallelism comes from running **many chunks across goroutines**, each with its
@@ -121,6 +165,8 @@ the better default.
 ## Checklist
 
 - [ ] Many independent buffers at high frequency/concurrency? → use this.
+- [ ] Streaming output per request instead? → pooled `az.Writer` with
+      `az.WithConcurrency(1)`, and always `Close()` before returning it.
 - [ ] One `sync.Pool` for `Encoder`, one for `Decoder`; Get/Put per call.
 - [ ] Never share an `Encoder`/`Decoder` across goroutines concurrently.
 - [ ] Reuse a `dst` scratch slice; copy the result out before reusing it.

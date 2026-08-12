@@ -52,9 +52,12 @@ type encoderState struct {
 	nWritten         int64
 	nInput           int64
 	frameContentSize int64
-	headerWritten    bool
-	eofWritten       bool
-	fullFrameWritten bool
+	// frameContentSizeKnown is set by ResetContentSize; it distinguishes a
+	// declared size of 0 from "no size declared" (az fork).
+	frameContentSizeKnown bool
+	headerWritten         bool
+	eofWritten            bool
+	fullFrameWritten      bool
 
 	// This waitgroup indicates an encode is running.
 	wg sync.WaitGroup
@@ -129,6 +132,7 @@ func (e *Encoder) Reset(w io.Writer) {
 	s.nInput = 0
 	s.writeErr = nil
 	s.frameContentSize = 0
+	s.frameContentSizeKnown = false
 }
 
 // ResetWithOptions will re-initialize the writer and apply the given options
@@ -158,11 +162,13 @@ func (e *Encoder) ResetWithOptions(w io.Writer, opts ...EOption) error {
 // If the bytes written does not match the size given an error will be returned
 // when calling Close().
 // This is removed when Reset is called.
-// Sizes <= 0 results in no content size set.
+// Negative sizes result in no content size set; a size of 0 declares an empty
+// frame (az fork: upstream treats 0 as "unset").
 func (e *Encoder) ResetContentSize(w io.Writer, size int64) {
 	e.Reset(w)
 	if size >= 0 {
 		e.state.frameContentSize = size
+		e.state.frameContentSizeKnown = true
 	}
 }
 
@@ -247,11 +253,12 @@ func (e *Encoder) nextBlock(final bool) error {
 
 		var tmp [maxHeaderSize]byte
 		fh := frameHeader{
-			ContentSize:   uint64(s.frameContentSize),
-			WindowSize:    uint32(s.encoder.WindowSize(s.frameContentSize)),
-			SingleSegment: false,
-			Checksum:      e.o.crc,
-			DictID:        e.o.dict.ID(),
+			ContentSize:      uint64(s.frameContentSize),
+			WindowSize:       uint32(s.encoder.WindowSize(s.frameContentSize)),
+			ContentSizeKnown: s.frameContentSizeKnown,
+			SingleSegment:    false,
+			Checksum:         e.o.crc,
+			DictID:           e.o.dict.ID(),
 		}
 
 		dst := fh.appendTo(tmp[:0])
@@ -468,7 +475,7 @@ func (e *Encoder) Close() error {
 		}
 		return err
 	}
-	if s.frameContentSize > 0 {
+	if s.frameContentSizeKnown {
 		if s.nInput != s.frameContentSize {
 			return fmt.Errorf("frame content size %d given, but %d bytes was written", s.frameContentSize, s.nInput)
 		}
@@ -556,11 +563,12 @@ func (e *Encoder) encodeAll(enc encoder, src, dst []byte) []byte {
 		single = *e.o.single
 	}
 	fh := frameHeader{
-		ContentSize:   uint64(len(src)),
-		WindowSize:    uint32(enc.WindowSize(int64(len(src)))),
-		SingleSegment: single,
-		Checksum:      e.o.crc,
-		DictID:        e.o.dict.ID(),
+		ContentSize:      uint64(len(src)),
+		WindowSize:       uint32(enc.WindowSize(int64(len(src)))),
+		ContentSizeKnown: true,
+		SingleSegment:    single,
+		Checksum:         e.o.crc,
+		DictID:           e.o.dict.ID(),
 	}
 
 	// If less than 1MB, allocate a buffer up front.

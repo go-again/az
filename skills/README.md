@@ -8,7 +8,8 @@ level trade-offs, or pooling gotchas.
 | Skill | Use when |
 |-------|----------|
 | [`az-integration`](az-integration/SKILL.md) | Adding/wiring az: one-shot `Compress`/`Decompress`, streaming `Writer`/`Reader`, level choice, errors, wire-format compatibility. |
-| [`az-pooling`](az-pooling/SKILL.md) | High-throughput per-chunk/per-request compression with pooled `Encoder`/`Decoder` (`EncodeAll`/`DecodeAll`). |
+| [`az-pooling`](az-pooling/SKILL.md) | High-throughput per-chunk/per-request compression with pooled `Encoder`/`Decoder` (`EncodeAll`/`DecodeAll`), and pooled streaming `Writer`s. |
+| [`az-http`](az-http/SKILL.md) | HTTP traffic: `azhttp` response-compression middleware, compressed request bodies, and the client `Transport`. |
 
 ## Install into a consuming project
 

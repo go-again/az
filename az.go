@@ -84,6 +84,9 @@ func Compress(src []byte, level Level) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
+		// Declare the (known) content size so every frame carries
+		// Frame_Content_Size; see the comment in Encoder.EncodeAll.
+		enc.ResetContentSize(&buf, int64(len(src)))
 		if _, err := enc.Write(src); err != nil {
 			return nil, err
 		}
@@ -122,18 +125,23 @@ func NewWriter(dst io.Writer, opts ...Option) *Writer {
 
 func newWriter(dst io.Writer, opts Options) *Writer {
 	w := &Writer{opts: opts}
+	concurrency := opts.Concurrency
+	if concurrency <= 0 {
+		concurrency = runtime.GOMAXPROCS(0)
+	}
 	if opts.Level <= Level2 {
 		w.lz4w = lz4pkg.NewWriter(dst)
 		_ = w.lz4w.Apply(
 			lz4pkg.CompressionLevelOption(lz4Level[opts.Level]),
 			lz4pkg.ChecksumOption(opts.Checksum),
 			lz4pkg.BlockChecksumOption(opts.Checksum),
-			lz4pkg.ConcurrencyOption(runtime.GOMAXPROCS(0)),
+			lz4pkg.ConcurrencyOption(concurrency),
 		)
 	} else {
 		enc, err := zstdpkg.NewWriter(dst,
 			zstdpkg.WithEncoderLevel(zstdLevel[opts.Level]),
 			zstdpkg.WithEncoderCRC(opts.Checksum),
+			zstdpkg.WithEncoderConcurrency(concurrency),
 		)
 		if err != nil {
 			// NewWriter only fails on invalid options; our options are always valid.
@@ -150,6 +158,17 @@ func (w *Writer) Write(p []byte) (int, error) {
 		return w.lz4w.Write(p)
 	}
 	return w.zstdEnc.Write(p)
+}
+
+// Flush compresses any buffered input and pushes it to the underlying writer,
+// so a reader on the other end can decode everything written so far. It does
+// not end the stream (that is Close) and it costs compression ratio, so flush
+// only when a consumer is actually waiting — a streaming HTTP response, say.
+func (w *Writer) Flush() error {
+	if w.lz4w != nil {
+		return w.lz4w.Flush()
+	}
+	return w.zstdEnc.Flush()
 }
 
 // Close flushes any buffered data and finalises the stream.
@@ -248,12 +267,17 @@ func (r *Reader) Reset(src io.Reader) {
 	r.br.Reset(src)
 	r.initialized = false
 	r.err = nil
+	// Release the old sub-reader rather than re-pointing it at r.br. The zstd
+	// decoder starts a stream goroutine on whatever reader it is Reset to, and
+	// that goroutine would then race the next stream for bytes out of the
+	// shared bufio.Reader; Close cancels it and waits. Either way the next
+	// Read re-detects the format and builds a fresh sub-reader.
 	if r.lz4r != nil {
-		r.lz4r.Reset(r.br)
+		r.lz4r.Reset(nil)
 		r.lz4r = nil
 	}
 	if r.zstdDec != nil {
-		r.zstdDec.Reset(r.br) //nolint // Reset returns error only on option changes
+		r.zstdDec.Close()
 		r.zstdDec = nil
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"io"
+	"runtime"
 	"testing"
 )
 
@@ -219,6 +220,46 @@ func TestReaderReset(t *testing.T) {
 
 	if !bytes.Equal(got1, src) || !bytes.Equal(got2, src) {
 		t.Fatal("Reader.Reset: content mismatch")
+	}
+}
+
+// TestReaderResetReleasesSubReader pins that Reset lets go of the previous
+// sub-reader instead of re-pointing it at the shared bufio.Reader. A zstd
+// decoder Reset onto that buffer keeps a stream goroutine alive, which then
+// races the next stream for its bytes — a leak under this test, a data race
+// under -race, and silent corruption in production.
+func TestReaderResetReleasesSubReader(t *testing.T) {
+	src := makePatterned(50000)
+	frames := make([][]byte, 0, 2)
+	for _, level := range []Level{Level1, Level3} { // lz4 and zstd sub-readers
+		frame, err := Compress(src, level)
+		if err != nil {
+			t.Fatal(err)
+		}
+		frames = append(frames, frame)
+	}
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	r := NewReader(bytes.NewReader(frames[0]))
+	for round := range 50 {
+		frame := frames[round%len(frames)]
+		r.Reset(bytes.NewReader(frame))
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("round %d: %v", round, err)
+		}
+		if !bytes.Equal(got, src) {
+			t.Fatalf("round %d: content mismatch (%d bytes)", round, len(got))
+		}
+	}
+	r.Close()
+
+	runtime.GC()
+	after := runtime.NumGoroutine()
+	if after > before+5 {
+		t.Fatalf("goroutine leak across Reset: before=%d after=%d", before, after)
 	}
 }
 

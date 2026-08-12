@@ -82,7 +82,13 @@ func (e *Encoder) EncodeAll(dst, src []byte, level Level) ([]byte, error) {
 		}
 		e.zstdEnc[level] = enc
 	}
-	enc.Reset(&e.buf)
+	// ResetContentSize (not Reset) declares the known input length, so the frame
+	// header always carries Frame_Content_Size: without it the streaming encoder
+	// writes the header before it knows the total, and inputs larger than one
+	// block (and empty ones) end up with no size recorded. Decoders that
+	// single-shot via the header — alloc(FCS) then decompress — need it on every
+	// frame. Compress does the same thing, keeping the two byte-identical.
+	enc.ResetContentSize(&e.buf, int64(len(src)))
 	if _, err := enc.Write(src); err != nil {
 		return nil, err
 	}

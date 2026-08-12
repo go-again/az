@@ -2,6 +2,7 @@ package az
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"runtime"
 	"testing"
@@ -93,6 +94,108 @@ func TestDecodeAllFormatIdentity(t *testing.T) {
 			})
 		}
 	}
+}
+
+// ─── Frame_Content_Size is always recorded by the one-shot paths ────────────────
+
+// zstdFCS reports whether a zstd frame header records Frame_Content_Size, plus
+// the size it records. Layout (RFC 8878 §3.1.1.1): 4 magic bytes, then the
+// Frame_Header_Descriptor, whose top two bits are FCS_Field_Size and whose bit 5
+// is Single_Segment_Flag; FCS is present iff FCS_Field_Size != 0 or the frame is
+// single-segment. The field itself follows the optional Window_Descriptor
+// (absent when single-segment) and the optional Dictionary_ID (never written
+// here).
+func zstdFCS(t *testing.T, frame []byte) (bool, uint64) {
+	t.Helper()
+	if len(frame) < 5 {
+		t.Fatalf("frame too short to hold a header: %d bytes", len(frame))
+	}
+	fhd := frame[4]
+	fcsSize := fhd >> 6
+	single := fhd&(1<<5) != 0
+	if fcsSize == 0 && !single {
+		return false, 0
+	}
+	off := 5
+	if !single {
+		off++ // Window_Descriptor
+	}
+	switch fcsSize {
+	case 0: // single-segment only: 1 byte
+		if len(frame) < off+1 {
+			t.Fatalf("truncated FCS field")
+		}
+		return true, uint64(frame[off])
+	case 1:
+		if len(frame) < off+2 {
+			t.Fatalf("truncated FCS field")
+		}
+		return true, uint64(binary.LittleEndian.Uint16(frame[off:])) + 256
+	case 2:
+		if len(frame) < off+4 {
+			t.Fatalf("truncated FCS field")
+		}
+		return true, uint64(binary.LittleEndian.Uint32(frame[off:]))
+	default:
+		if len(frame) < off+8 {
+			t.Fatalf("truncated FCS field")
+		}
+		return true, binary.LittleEndian.Uint64(frame[off:])
+	}
+}
+
+// TestOneShotAlwaysStoresContentSize pins the contract that decoders relying on
+// the header alone (get frame content size → allocate → decompress in one shot)
+// depend on: every zstd frame from Compress/EncodeAll carries the exact
+// uncompressed size, at every input size — including sizes below 256 bytes and
+// above one block, which the streaming encoder used to leave unrecorded.
+func TestOneShotAlwaysStoresContentSize(t *testing.T) {
+	sizes := []int{
+		0, 1, 2, 255, 256, 257, 1024, 5 << 10, 64 << 10,
+		(128 << 10) - 1, 128 << 10, (128 << 10) + 1, 300 << 10, 1 << 20,
+	}
+	enc := NewEncoder()
+	for _, n := range sizes {
+		for _, level := range []Level{Level3, Level4, Level5} {
+			data := makePatterned(n)
+			for _, tc := range []struct {
+				name  string
+				frame []byte
+			}{
+				{"Compress", mustCompress(t, data, level)},
+				{"EncodeAll", mustEncodeAll(t, enc, data, level)},
+			} {
+				ok, got := zstdFCS(t, tc.frame)
+				if !ok {
+					t.Errorf("%s(%d bytes, L%d): frame header has no Frame_Content_Size (descriptor %#02x)",
+						tc.name, n, level, tc.frame[4])
+					continue
+				}
+				if got != uint64(n) {
+					t.Errorf("%s(%d bytes, L%d): Frame_Content_Size = %d, want %d",
+						tc.name, n, level, got, n)
+				}
+			}
+		}
+	}
+}
+
+func mustCompress(t *testing.T, data []byte, level Level) []byte {
+	t.Helper()
+	frame, err := Compress(data, level)
+	if err != nil {
+		t.Fatalf("Compress: %v", err)
+	}
+	return frame
+}
+
+func mustEncodeAll(t *testing.T, enc *Encoder, data []byte, level Level) []byte {
+	t.Helper()
+	frame, err := enc.EncodeAll(nil, data, level)
+	if err != nil {
+		t.Fatalf("EncodeAll: %v", err)
+	}
+	return frame
 }
 
 // ─── Reuse correctness: no state bleed across calls ──────────────────────────────
