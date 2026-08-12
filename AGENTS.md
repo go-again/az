@@ -86,7 +86,17 @@ idioms (`SA4004`/`U1000`/…) that aren't bugs and shouldn't drift from upstream
 (see `.golangci.yml`). `gofmt` covers everything except `internal/` and dot-dirs.
 CI (`.github/workflows/ci.yml`, modeled on gosqlite.org) runs test
 (ubuntu/macos/windows × Go 1.25/1.26), race, the same lint gate, and a
-cross-build matrix.
+cross-build matrix. The lint job runs on Go 1.26 specifically: the pinned
+gopls/modernize needs it to build, and `setup-go` sets `GOTOOLCHAIN=local`, so
+the job can't fetch a newer toolchain the way a developer's default
+`GOTOOLCHAIN=auto` does. az itself still targets 1.25 (`go.mod`).
+
+**`.gitattributes` sets `* -text`, and that is load-bearing.** Git for Windows
+defaults to `core.autocrlf=true`; the fixtures in `internal/testdata` are
+compressed and compared byte for byte, and `internal/fse`'s `ExampleCompress`
+asserts an exact size. A CRLF-translated `e.txt` is 100004 bytes instead of
+100003 and the example fails on Windows only, looking like a codec bug. Don't
+"clean up" that file.
 
 Plain `go build ./...` / `go test ./...` also work. Note: first compile of the
 vendored zstd/lz4/fse packages is slow (tens of seconds) — be patient and

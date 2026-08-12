@@ -45,6 +45,14 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: ./.github/actions/setup
+        with:
+          # Lint tools are dev tools and track the newest Go line: the pinned
+          # gopls/modernize requires Go >= 1.26 to build. setup-go pins
+          # GOTOOLCHAIN=local, so it cannot fetch a newer toolchain on demand
+          # the way a developer's default GOTOOLCHAIN=auto would — the job has
+          # to start on 1.26. az itself still builds and tests on 1.25 (go.mod)
+          # and the test matrix proves it.
+          go-version: '1.26.x'
       - name: go vet
         # vet runs over the whole module (it's clean on the vendored internal/
         # trees); the stricter linters below stay scoped to az's own code.
@@ -69,7 +77,9 @@ jobs:
           args: --timeout 5m
       - name: gopls modernize
         # Surfaces Go-version-bump idioms (min/max, range-over-int, WaitGroup.Go,
-        # …); scoped to az's own packages. Exits non-zero when it finds any.
+        # …); scoped to az's own packages. Exits non-zero when it finds any —
+        # the previous version of this step piped the output through `grep -v`
+        # and `|| true`, which swallowed both findings and tool failures.
         run: go run golang.org/x/tools/gopls/internal/analysis/modernize/cmd/modernize@v0.23.0 . ./azhttp/... ./cmd/... ./examples/...
       - name: go.mod tidy
         run: |

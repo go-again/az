@@ -1,0 +1,20 @@
+# Byte-for-byte checkouts on every platform.
+#
+# The fixtures under internal/testdata are compressed and compared byte for
+# byte, and internal/fse's ExampleCompress asserts an exact input and output
+# size. Git for Windows defaults to core.autocrlf=true, so without this a
+# Windows checkout rewrites the single LF in e.txt to CRLF — 100003 bytes
+# become 100004, the FSE alphabet gains a symbol, and the example fails with a
+# one-byte difference that looks like a codec bug.
+#
+# Disabling text conversion repo-wide is the safe fix: Go sources are LF by
+# convention, gofmt emits LF, and nothing here needs CRLF. After adding this to
+# an existing Windows clone, run `git add --renormalize .` once.
+* -text
+
+# Binary fixtures: don't try to diff them.
+*.bin binary
+*.data binary
+*.gz binary
+*.out binary
+*.zip binary

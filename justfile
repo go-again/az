@@ -8,6 +8,11 @@
 # install and everyone — including CI — runs the same versions. The first run
 # fetches and builds them into the module cache; after that they are instant.
 # Bump a version here and in .github/workflows/ci.yml together.
+#
+# The pinned modernize (gopls) needs Go >= 1.26 to build, one line ahead of the
+# go.mod minimum. The default GOTOOLCHAIN=auto fetches it for you; if you have
+# set GOTOOLCHAIN=local on an older Go, `just modernize` is the one recipe that
+# will complain.
 
 set quiet
 
